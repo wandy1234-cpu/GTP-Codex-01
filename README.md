@@ -64,6 +64,21 @@ python quant_alpha_system.py --input-csv your_ah_data.csv --horizon 5 --topn 10
 python quant_alpha_system.py --demo
 ```
 
+## 5.1) Windows 一键脚本
+
+仓库已提供 `run_alpha_windows.bat`，支持三种模式：
+
+```bat
+run_alpha_windows.bat demo
+run_alpha_windows.bat live
+run_alpha_windows.bat csv your_ah_data.csv
+```
+
+说明：
+- 自动把权重输出到 `outputs\portfolio_时间戳.csv`
+- 自动维护 `outputs\latest_portfolio.csv` 作为下一次的 `--prev-weights`
+- `live` 模式默认用大陆优先数据源：`eastmoney,tencent,yahoo,stooq`
+
 ## 6) 这次算法/工程升级点
 
 - 新增 Eastmoney（东财）实时 quote 接口（实时价格 + 时间戳）

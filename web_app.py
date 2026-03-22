@@ -34,6 +34,7 @@ PAGE = """<!doctype html>
         <select id="mode">
           <option value="demo">demo（离线）</option>
           <option value="live">live（在线）</option>
+          <option value="etf">etf（大陆ETF轮动）</option>
           <option value="csv">csv（本地文件）</option>
         </select>
       </div>
@@ -186,6 +187,10 @@ class Handler(BaseHTTPRequestHandler):
             cmd.append("--demo")
         elif mode == "live":
             cmd.extend(["--providers", providers])
+            if db_only == "1":
+                cmd.append("--db-only")
+        elif mode == "etf":
+            cmd.extend(["--providers", providers, "--cn-etf-rotation", "--auto-tune-horizon-weights"])
             if db_only == "1":
                 cmd.append("--db-only")
         elif mode == "csv":

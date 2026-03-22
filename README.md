@@ -32,6 +32,8 @@ python quant_alpha_system.py
 - `--save-weights out.csv`（保存本期建议权重）
 - `--db-path alpha_realtime.db`（实时数据库路径）
 - `--db-only`（仅使用本地数据库运行，不访问网络）
+- `--cn-etf-rotation`（启用大陆 ETF 轮动模式：自动拉取沪深 ETF 池）
+- `--cn-etf-limit 800`（大陆 ETF 池拉取上限）
 - `--horizons 5,10,20`（多标签周期）
 - `--horizon-weights 0.2,0.3,0.5`（多标签融合权重）
 - `--auto-tune-horizon-weights`（根据 holdout 回测胜率自动反推多周期融合权重）
@@ -74,6 +76,22 @@ python quant_alpha_system.py --horizons 5,10,20 --auto-tune-horizon-weights
 - 用 `max(胜率-0.5, 0.0001) * log(1+样本数)` 计算分数并归一化为权重；
 - 适合作为“先验自动调参”，建议再做样本外窗口复核。
 
+## 3.2) 大陆 ETF 轮动推荐（新增）
+
+```bash
+python quant_alpha_system.py \
+  --cn-etf-rotation \
+  --providers eastmoney,tencent,yahoo,stooq \
+  --benchmark 510300.SS \
+  --topn 20 \
+  --auto-tune-horizon-weights
+```
+
+说明：
+- 自动从 Eastmoney 拉取沪深 ETF 列表（失败时回退到内置 ETF 池）；
+- 默认 benchmark 若仍为 `000300.SS`，会自动切到 `510300.SS`；
+- 输出逻辑不变：TopN + 建议组合权重 + 风险/成本惩罚。
+
 ## 4) 使用你自己的 CSV
 
 CSV 列：`date,ticker,close,high,low,volume`
@@ -95,6 +113,7 @@ python quant_alpha_system.py --demo
 ```bat
 run_alpha_windows.bat demo
 run_alpha_windows.bat live
+run_alpha_windows.bat etf
 run_alpha_windows.bat csv your_ah_data.csv
 ```
 

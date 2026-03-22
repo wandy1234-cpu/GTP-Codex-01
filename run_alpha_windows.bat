@@ -5,6 +5,7 @@ REM A/H Alpha System Windows launcher
 REM Usage:
 REM   run_alpha_windows.bat demo
 REM   run_alpha_windows.bat live
+REM   run_alpha_windows.bat etf
 REM   run_alpha_windows.bat csv your_ah_data.csv
 
 set MODE=%1
@@ -35,6 +36,16 @@ if /I "%MODE%"=="live" (
   goto END
 )
 
+if /I "%MODE%"=="etf" (
+  echo [INFO] Running CN ETF rotation mode...
+  if exist "%PREV_FILE%" (
+    %PYTHON_BIN% %SCRIPT% --cn-etf-rotation --providers eastmoney,tencent,yahoo,stooq --benchmark 510300.SS --topn 20 --max-weight 0.20 --risk-aversion 0.20 --cost-penalty 0.12 --auto-tune-horizon-weights --prev-weights "%PREV_FILE%" --save-weights "%OUT_FILE%"
+  ) else (
+    %PYTHON_BIN% %SCRIPT% --cn-etf-rotation --providers eastmoney,tencent,yahoo,stooq --benchmark 510300.SS --topn 20 --max-weight 0.20 --risk-aversion 0.20 --cost-penalty 0.12 --auto-tune-horizon-weights --save-weights "%OUT_FILE%"
+  )
+  goto END
+)
+
 if /I "%MODE%"=="csv" (
   set CSV_PATH=%2
   if "%CSV_PATH%"=="" (
@@ -55,6 +66,7 @@ echo [ERROR] Unknown mode: %MODE%
 echo Usage:
 echo   run_alpha_windows.bat demo
 echo   run_alpha_windows.bat live
+echo   run_alpha_windows.bat etf
 echo   run_alpha_windows.bat csv your_ah_data.csv
 exit /b 1
 

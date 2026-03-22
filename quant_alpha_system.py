@@ -61,6 +61,14 @@ DEFAULT_TICKERS = [
     "000651.SZ", "0700.HK", "9988.HK", "0939.HK", "1299.HK", "0388.HK", "2318.HK",
 ]
 
+DEFAULT_CN_ETF_TICKERS = [
+    "510300.SS", "510050.SS", "510500.SS", "159919.SZ", "159915.SZ", "159949.SZ", "159928.SZ",
+    "512880.SS", "512170.SS", "512660.SS", "512010.SS", "512690.SS", "512800.SS", "512480.SS",
+    "512400.SS", "512760.SS", "512200.SS", "515790.SS", "516160.SS", "516970.SS", "516510.SS",
+    "588000.SS", "588080.SS", "159995.SZ", "159967.SZ", "159825.SZ", "159852.SZ", "159980.SZ",
+    "513100.SS", "513500.SS", "513050.SS", "513180.SS", "513080.SS", "159920.SZ", "511010.SS",
+]
+
 STOCK_NAME_MAP = {
     "000858.SZ": "五粮液",
     "600519.SS": "贵州茅台",
@@ -465,6 +473,45 @@ def fetch_stock_names_tencent(tickers: List[str]) -> Dict[str, str]:
         if tk and name:
             out[tk] = name
     return out
+
+
+def is_mainland_etf_code(code: str) -> bool:
+    if len(code) != 6 or not code.isdigit():
+        return False
+    sh_prefix = ("510", "511", "512", "513", "515", "516", "517", "518", "56", "58")
+    sz_prefix = ("159", "16")
+    return code.startswith(sh_prefix) or code.startswith(sz_prefix)
+
+
+def fetch_cn_etf_universe_eastmoney(limit: int = 2000) -> List[str]:
+    """
+    获取大陆 ETF 列表（沪深基金市场），失败时由上层回退内置 ETF 池。
+    """
+    params = {
+        "pn": "1",
+        "pz": str(max(50, min(limit, 5000))),
+        "po": "1",
+        "np": "1",
+        "fltt": "2",
+        "invt": "2",
+        "fid": "f3",
+        "fs": "m:1 t:8,m:0 t:8",
+        "fields": "f12,f13,f14",
+    }
+    url = f"https://push2.eastmoney.com/api/qt/clist/get?{urlencode(params)}"
+    payload = fetch_json(url)
+    diff = ((payload.get("data") or {}).get("diff")) or []
+    out: List[str] = []
+    for item in diff:
+        code = str(item.get("f12") or "").strip()
+        market = int(item.get("f13") or -1)
+        if not is_mainland_etf_code(code):
+            continue
+        if market == 1:
+            out.append(f"{code}.SS")
+        elif market == 0:
+            out.append(f"{code}.SZ")
+    return list(dict.fromkeys(out))
 
 
 def fetch_live_data(
@@ -1167,6 +1214,8 @@ def main():
         default=",".join(DEFAULT_TICKERS),
         help="Tickers for live download mode",
     )
+    parser.add_argument("--cn-etf-rotation", action="store_true", help="Use mainland ETF universe for rotation recommendation")
+    parser.add_argument("--cn-etf-limit", type=int, default=800, help="Max ETF symbols to load from Eastmoney universe API")
     parser.add_argument("--providers", type=str, default="eastmoney,tencent,yahoo,stooq", help="Data providers in priority order")
     parser.add_argument("--start", type=str, default="2021-01-01")
     parser.add_argument("--end", type=str, default=dt.date.today().isoformat())
@@ -1206,7 +1255,19 @@ def main():
     else:
         start = dt.datetime.strptime(args.start, "%Y-%m-%d").date()
         end = dt.datetime.strptime(args.end, "%Y-%m-%d").date()
-        tickers = ensure_ticker_pool_size(parse_tickers(args.tickers), args.topn, args.benchmark)
+        if args.cn_etf_rotation:
+            try:
+                etf_pool = fetch_cn_etf_universe_eastmoney(limit=args.cn_etf_limit)
+                if not etf_pool:
+                    raise RuntimeError("empty ETF universe from eastmoney")
+            except RuntimeError as exc:
+                print(f"[WARN] cn-etf universe fetch failed, fallback built-in ETF pool: {exc}")
+                etf_pool = DEFAULT_CN_ETF_TICKERS[:]
+            if args.benchmark == "000300.SS":
+                args.benchmark = "510300.SS"
+            tickers = ensure_ticker_pool_size(etf_pool, max(args.topn, 20), args.benchmark)
+        else:
+            tickers = ensure_ticker_pool_size(parse_tickers(args.tickers), args.topn, args.benchmark)
         providers = parse_providers(args.providers)
         if args.db_only:
             data = load_history_from_db(args.db_path, tickers, start, end)
@@ -1347,6 +1408,8 @@ def main():
     print(f"Run Time (UTC) : {run_ts}")
     print(f"Data Source    : {source}")
     print(f"Realtime DB    : {args.db_path}")
+    if args.cn_etf_rotation:
+        print(f"Universe Mode  : CN ETF Rotation ({len(tickers)} symbols)")
     print(f"Benchmark      : {args.benchmark}")
     print("Label Mode     : excess return > 0 (fallback: absolute return > 0)")
     print(f"Feature Set    : {', '.join(FEATURE_NAMES)}")

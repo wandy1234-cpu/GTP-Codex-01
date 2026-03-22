@@ -1,6 +1,8 @@
 import html
 import json
 import subprocess
+import threading
+import webbrowser
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import parse_qs, urlparse
 
@@ -42,7 +44,7 @@ PAGE = """<!doctype html>
     </div>
 
     <label>CSV 路径（仅 csv 模式）</label>
-    <input id="csv" placeholder="例如: C:\\data\\your_ah_data.csv" />
+    <input id="csv" value="C:\\Users\\Admin\\Desktop\\GTP-Codex-01" />
 
     <div class="row">
       <div>
@@ -204,7 +206,9 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
-    print(f"Web UI running on http://{HOST}:{PORT}")
+    url = f"http://{HOST}:{PORT}"
+    print(f"Web UI running on {url}")
+    threading.Timer(0.8, lambda: webbrowser.open(url)).start()
     HTTPServer((HOST, PORT), Handler).serve_forever()
 
 

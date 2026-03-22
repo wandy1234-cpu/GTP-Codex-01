@@ -9,6 +9,8 @@
 - **新增风控/换手感知**：组合打分加入风险惩罚与成本惩罚，并支持读取上期权重估算换手
 - **新增实时数据库**：使用 SQLite 缓存历史与实时行情，支持断网回退继续运行
 - **专业输出格式**：终端报告增加系统名、策略介绍、运行时间、数据来源、模型区块
+- **可读性升级**：股票代码后自动显示股票名称（如 `000858.SZ(五粮液)`）
+- **TopN 修正**：请求多少条就返回多少条（不足时用占位行提示）
 - 仍保持纯 Python（无第三方库）
 
 ## 1) 默认运行（实时优先）
@@ -99,10 +101,13 @@ python web_app.py
 http://127.0.0.1:8000
 ```
 
+> 现在执行 `python web_app.py` 会自动尝试打开默认浏览器。
+
 页面支持：
 - `demo` / `live` / `csv` 三种模式
 - TopN、benchmark、providers、max-weight、risk-aversion、cost-penalty 参数可视化配置
 - DB Path、DB Only 可视化配置（实时数据库模式）
+- CSV 路径默认预填：`C:\Users\Admin\Desktop\GTP-Codex-01`
 - 在线展示 `quant_alpha_system.py` 的完整输出
 
 ## 6) 这次算法/工程升级点

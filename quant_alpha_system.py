@@ -53,6 +53,25 @@ FEATURE_NAMES = [
     "price_pos_20d",
 ]
 
+DEFAULT_TICKERS = [
+    "000300.SS", "600519.SS", "000858.SZ", "601318.SS", "601166.SS", "600036.SS", "600276.SS",
+    "601888.SS", "600900.SS", "600031.SS", "300750.SZ", "002594.SZ", "000333.SZ", "002415.SZ",
+    "000651.SZ", "0700.HK", "9988.HK", "0939.HK", "1299.HK", "0388.HK", "2318.HK",
+]
+
+STOCK_NAME_MAP = {
+    "000858.SZ": "五粮液",
+    "600519.SS": "贵州茅台",
+    "601318.SS": "中国平安",
+    "000300.SS": "沪深300ETF近似",
+    "0700.HK": "腾讯控股",
+    "9988.HK": "阿里巴巴-W",
+    "0939.HK": "建设银行",
+    "1299.HK": "友邦保险",
+    "0388.HK": "香港交易所",
+    "2318.HK": "中国平安(港股)",
+}
+
 
 def sigmoid(x: float) -> float:
     if x < -40:
@@ -531,7 +550,7 @@ def load_latest_quotes_from_db(db_path: str, tickers: List[str]) -> Dict[str, Tu
 
 def generate_demo_data(seed: int = 42) -> Dict[str, List[Row]]:
     random.seed(seed)
-    tickers = ["000300.SS", "600519.SS", "000858.SZ", "601318.SS", "0700.HK", "9988.HK", "0939.HK"]
+    tickers = DEFAULT_TICKERS
     start = dt.date(2022, 1, 3)
     days = 900
     out: Dict[str, List[Row]] = defaultdict(list)
@@ -768,7 +787,10 @@ def rank_latest(
             ranked.append((s.ticker, s.close, p, risk_20d, f"daily@{latest_date.isoformat()}"))
 
     ranked.sort(key=lambda x: x[2], reverse=True)
-    return latest_date, ranked[:topn]
+    top = ranked[:topn]
+    while len(top) < topn:
+        top.append((f"N/A_{len(top)+1}", 0.0, 0.0, 0.0, "insufficient_universe"))
+    return latest_date, top
 
 
 def load_prev_weights(path: str) -> Dict[str, float]:
@@ -846,6 +868,23 @@ def parse_tickers(tickers_str: str) -> List[str]:
     return [t.strip() for t in tickers_str.split(",") if t.strip()]
 
 
+def ensure_ticker_pool_size(tickers: List[str], topn: int, benchmark: str) -> List[str]:
+    needed = max(topn + 1, 12)  # +1 because benchmark may be excluded from candidates
+    out = list(dict.fromkeys(tickers))
+    if benchmark not in out:
+        out.insert(0, benchmark)
+    for tk in DEFAULT_TICKERS:
+        if len(out) >= needed:
+            break
+        if tk not in out:
+            out.append(tk)
+    return out
+
+
+def stock_name(ticker: str) -> str:
+    return STOCK_NAME_MAP.get(ticker, ticker)
+
+
 def parse_providers(providers_str: str) -> List[str]:
     out = [p.strip().lower() for p in providers_str.split(",") if p.strip()]
     valid = {"eastmoney", "tencent", "yahoo", "stooq"}
@@ -861,7 +900,7 @@ def main():
     parser.add_argument(
         "--tickers",
         type=str,
-        default="000300.SS,600519.SS,000858.SZ,601318.SS,0700.HK,9988.HK,0939.HK",
+        default=",".join(DEFAULT_TICKERS),
         help="Tickers for live download mode",
     )
     parser.add_argument("--providers", type=str, default="eastmoney,tencent,yahoo,stooq", help="Data providers in priority order")
@@ -894,7 +933,7 @@ def main():
     else:
         start = dt.datetime.strptime(args.start, "%Y-%m-%d").date()
         end = dt.datetime.strptime(args.end, "%Y-%m-%d").date()
-        tickers = parse_tickers(args.tickers)
+        tickers = ensure_ticker_pool_size(parse_tickers(args.tickers), args.topn, args.benchmark)
         providers = parse_providers(args.providers)
         if args.db_only:
             data = load_history_from_db(args.db_path, tickers, start, end)
@@ -968,12 +1007,16 @@ def main():
     print("----------------------------------------------")
     print(f"TOP {args.topn} CANDIDATES @ model_date={latest_date.isoformat()}")
     for tk, px, p, risk20, src in top:
-        print(f"{tk:10s} px={px:10.3f} up_prob={p:.4f} risk20={risk20:.4f} [{src}]")
+        nm = stock_name(tk)
+        shown = f"{tk}({nm})"
+        print(f"{shown:26s} px={px:10.3f} up_prob={p:.4f} risk20={risk20:.4f} [{src}]")
 
     print("----------------------------------------------")
     print("SUGGESTED PORTFOLIO (alpha+risk+cost)")
     for tk, wt, p, risk20, src in portfolio:
-        print(f"{tk:10s} weight={wt:6.2%} up_prob={p:.4f} risk20={risk20:.4f} [{src}]")
+        nm = stock_name(tk)
+        shown = f"{tk}({nm})"
+        print(f"{shown:26s} weight={wt:6.2%} up_prob={p:.4f} risk20={risk20:.4f} [{src}]")
     if args.prev_weights:
         print(f"Estimated turnover vs prev portfolio: {turnover:.2%}")
     if args.save_weights:

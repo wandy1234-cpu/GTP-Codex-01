@@ -31,13 +31,14 @@ python quant_alpha_system.py
 - `--prev-weights prev.csv`（上一期权重，估算换手）
 - `--save-weights out.csv`（保存本期建议权重）
 - `--db-path alpha_realtime.db`（实时数据库路径）
-- `--db-only`（仅使用本地数据库运行，不访问网络，**默认开启**）
-- `--no-db-only`（允许联网拉取/刷新数据）
+- `--db-only`（仅使用本地数据库运行，不访问网络）
+- `--no-db-only`（允许联网拉取/刷新数据，**默认开启**）
 - `--cn-etf-rotation`（启用大陆 ETF 轮动模式：自动拉取沪深 ETF 池）
 - `--cn-etf-limit 800`（大陆 ETF 池拉取上限）
 - `--horizons 5,10,20`（多标签周期）
 - `--horizon-weights 0.2,0.3,0.5`（多标签融合权重）
 - `--auto-tune-horizon-weights`（根据 holdout 回测胜率自动反推多周期融合权重）
+- `--min-samples 500`（每个 horizon 最低样本门槛；ETF 模式默认自动放宽到 180）
 - `--report-csv one_year_report.csv`（导出近1年每日胜率报告）
 - 会尝试实时 quote 刷新；失败则回退到最新日线
 - 为避免 `--db-only` 与联网模式因“陈旧实时价”产生偏差，程序仅使用不早于 `--end` 当天 00:00(UTC) 的 quote，过旧 quote 自动忽略并回退日线收盘价
@@ -67,10 +68,10 @@ python quant_alpha_system.py \
 python quant_alpha_system.py --no-realtime
 ```
 
-如果你想临时允许联网刷新（覆盖默认 DB-Only），加：
+如果你想强制只用数据库（断网/稳态复现），加：
 
 ```bash
-python quant_alpha_system.py --no-db-only
+python quant_alpha_system.py --db-only
 ```
 
 ## 3.1) 根据回测结果反向优化模型（自动调融合权重）

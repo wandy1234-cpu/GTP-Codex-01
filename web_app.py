@@ -32,8 +32,8 @@ PAGE = """<!doctype html>
       <div>
         <label>运行模式</label>
         <select id="mode">
-          <option value="demo">demo（离线）</option>
           <option value="live">live（在线）</option>
+          <option value="demo">demo（离线）</option>
           <option value="etf">etf（大陆ETF轮动）</option>
           <option value="csv">csv（本地文件）</option>
         </select>
@@ -80,8 +80,8 @@ PAGE = """<!doctype html>
       <div>
         <label>DB Only</label>
         <select id="db_only">
-          <option value="1">是（仅本地实时库，推荐）</option>
-          <option value="0">否（允许联网刷新）</option>
+          <option value="0">否（允许联网刷新，默认）</option>
+          <option value="1">是（仅本地实时库）</option>
         </select>
       </div>
     </div>

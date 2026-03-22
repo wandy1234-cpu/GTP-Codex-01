@@ -1244,11 +1244,12 @@ def main():
     parser.add_argument("--save-weights", type=str, default="", help="Output CSV path to save new suggested weights")
     parser.add_argument("--report-csv", type=str, default="", help="Export one-year backtest daily win-rate report CSV")
     parser.add_argument("--db-path", type=str, default="alpha_realtime.db", help="SQLite path for realtime/history cache")
-    parser.set_defaults(db_only=True)
-    parser.add_argument("--db-only", dest="db_only", action="store_true", help="Run using local realtime database only (default)")
-    parser.add_argument("--no-db-only", dest="db_only", action="store_false", help="Allow network fetch/refresh (override default db-only)")
+    parser.set_defaults(db_only=False)
+    parser.add_argument("--db-only", dest="db_only", action="store_true", help="Run using local realtime database only")
+    parser.add_argument("--no-db-only", dest="db_only", action="store_false", help="Allow network fetch/refresh (default)")
     parser.add_argument("--demo", action="store_true", help="Force synthetic demo data")
     parser.add_argument("--no-realtime", action="store_true", help="Disable realtime quote refresh")
+    parser.add_argument("--min-samples", type=int, default=500, help="Minimum sample count required per horizon")
     args = parser.parse_args()
 
     latest_quote: Dict[str, Tuple[float, dt.datetime]] = {}
@@ -1330,9 +1331,13 @@ def main():
     metrics_rows: List[Tuple[int, int, int, float, float, float, float]] = []
     latest_dates: List[dt.date] = []
 
+    min_samples_required = max(50, args.min_samples)
+    if args.cn_etf_rotation and args.min_samples == 500:
+        min_samples_required = 180
+
     for h in horizons:
         samples_h = build_samples(data, horizon=h, benchmark_ticker=args.benchmark)
-        if len(samples_h) < 500:
+        if len(samples_h) < min_samples_required:
             continue
         train, test = train_test_split(samples_h, split_ratio=0.8)
         if not train or not test:
@@ -1361,8 +1366,40 @@ def main():
             mapp[s.ticker] = (px, p, risk20, src)
         per_horizon_maps[h] = mapp
 
+    if not per_horizon_maps and args.cn_etf_rotation:
+        print("[WARN] ETF mode: multi-horizon samples insufficient, fallback to single horizon=5 with relaxed threshold.")
+        h = 5
+        samples_h = build_samples(data, horizon=h, benchmark_ticker=args.benchmark)
+        if len(samples_h) >= 120:
+            train, test = train_test_split(samples_h, split_ratio=0.8)
+            if train and test:
+                x_train, y_train, x_test, y_test, means, stds = standardize(train, test)
+                w, b = train_logistic_sgd(x_train, y_train)
+                probs = predict_prob(w, b, x_test)
+                t = best_threshold(y_test, probs)
+                m = compute_metrics(y_test, probs, threshold=t)
+                metrics_rows.append((h, len(train), len(test), t, m.accuracy, m.precision, m.auc))
+                per_horizon_test[h] = [(row.date, row.ticker, pp, yy) for row, pp, yy in zip(test, probs, y_test)]
+                latest_date = max(s.date for s in samples_h)
+                latest_dates.append(latest_date)
+                latest = [s for s in samples_h if s.date == latest_date]
+                mapp: Dict[str, Tuple[float, float, float, str]] = {}
+                for s in latest:
+                    x = [(s.features[i] - means[i]) / stds[i] for i in range(len(means))]
+                    p = sigmoid(sum(w[j] * x[j] for j in range(len(w))) + b)
+                    risk20 = s.features[4] if len(s.features) > 4 else 0.0
+                    if latest_quote and s.ticker in latest_quote:
+                        px, ts = latest_quote[s.ticker]
+                        src = f"live@{ts.isoformat()}Z"
+                    else:
+                        px, src = s.close, f"daily@{latest_date.isoformat()}"
+                    mapp[s.ticker] = (px, p, risk20, src)
+                per_horizon_maps[h] = mapp
+                horizons = [h]
+                h_weights = [1.0]
+
     if not per_horizon_maps:
-        raise ValueError("Not enough samples across configured horizons.")
+        raise ValueError("Not enough samples across configured horizons. Try longer history, --min-samples 180, or --db-only/--demo.")
 
     latest_date = max(latest_dates) if latest_dates else dt.date.today()
     tickers_union = set()

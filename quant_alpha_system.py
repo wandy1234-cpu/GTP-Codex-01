@@ -391,9 +391,9 @@ def fetch_latest_quote_eastmoney(tickers: List[str]) -> Dict[str, Tuple[float, d
             px = float(px_raw) / 100.0
             # f86 usually unix seconds; if missing fallback now.
             if ts_raw is None:
-                ts = dt.datetime.utcnow()
+                ts = dt.datetime.now(dt.timezone.utc)
             else:
-                ts = dt.datetime.utcfromtimestamp(int(ts_raw))
+                ts = dt.datetime.fromtimestamp(int(ts_raw), tz=dt.timezone.utc)
             out[ticker] = (px, ts)
         except (ValueError, TypeError, OSError):
             continue
@@ -428,7 +428,7 @@ def fetch_latest_quote_tencent(tickers: List[str]) -> Dict[str, Tuple[float, dt.
                 continue
             tk = inv.get(symbol)
             if tk:
-                out[tk] = (px, dt.datetime.utcnow())
+                out[tk] = (px, dt.datetime.now(dt.timezone.utc))
         except ValueError:
             continue
     return out
@@ -718,6 +718,8 @@ def filter_fresh_quotes(
     """
     out: Dict[str, Tuple[float, dt.datetime]] = {}
     for tk, (px, ts) in quotes.items():
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=dt.timezone.utc)
         if ts >= min_ts_utc:
             out[tk] = (px, ts)
     return out
@@ -729,7 +731,7 @@ def save_names_to_db(db_path: str, names: Dict[str, str]) -> None:
     init_db(db_path)
     conn = sqlite3.connect(db_path)
     cur = conn.cursor()
-    ts = dt.datetime.utcnow().isoformat()
+    ts = dt.datetime.now(dt.timezone.utc).isoformat()
     for tk, nm in names.items():
         cur.execute(
             "INSERT OR REPLACE INTO instrument_names (ticker, name, updated_utc) VALUES (?, ?, ?)",
@@ -1222,6 +1224,55 @@ def parse_providers(providers_str: str) -> List[str]:
     return out
 
 
+def choose_latest_display_source(
+    current: Optional[Tuple[float, float, str]],
+    candidate: Tuple[float, float, str],
+) -> Tuple[float, float, str]:
+    """
+    Pick the display tuple with the freshest source timestamp/date.
+    Tuple format: (price, risk20, src)
+    src formats: live@<iso8601>Z / daily@YYYY-MM-DD
+    """
+    if current is None:
+        return candidate
+
+    def to_dt(src: str) -> dt.datetime:
+        try:
+            if src.startswith("live@"):
+                raw = src[5:]
+                if raw.endswith("Z"):
+                    raw = raw[:-1] + "+00:00"
+                return dt.datetime.fromisoformat(raw)
+            if src.startswith("daily@"):
+                d = dt.datetime.strptime(src[6:], "%Y-%m-%d").date()
+                return dt.datetime.combine(d, dt.time.min, tzinfo=dt.timezone.utc)
+        except Exception:
+            pass
+        return dt.datetime(1900, 1, 1, tzinfo=dt.timezone.utc)
+
+    return candidate if to_dt(candidate[2]) >= to_dt(current[2]) else current
+
+
+def source_to_date(src: str, fallback: dt.date) -> dt.date:
+    try:
+        if src.startswith("live@"):
+            raw = src[5:]
+            if raw.endswith("Z"):
+                raw = raw[:-1] + "+00:00"
+            return dt.datetime.fromisoformat(raw).date()
+        if src.startswith("daily@"):
+            return dt.datetime.strptime(src[6:], "%Y-%m-%d").date()
+    except Exception:
+        pass
+    return fallback
+
+
+def format_live_src(ts: dt.datetime) -> str:
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=dt.timezone.utc)
+    return "live@" + ts.astimezone(dt.timezone.utc).isoformat().replace("+00:00", "Z")
+
+
 def main():
     parser = argparse.ArgumentParser(description="A/H Alpha Pro v10 (multi-horizon ensemble for index enhancement)")
     parser.add_argument("--input-csv", type=str, default="", help="CSV path with columns: date,ticker,close,high,low,volume")
@@ -1315,7 +1366,7 @@ def main():
         if args.db_only:
             data = load_history_from_db(args.db_path, tickers, start, end)
             latest_quote = load_latest_quotes_from_db(args.db_path, tickers)
-            fresh_cutoff = dt.datetime.combine(end, dt.time.min)
+            fresh_cutoff = dt.datetime.combine(end, dt.time.min, tzinfo=dt.timezone.utc)
             latest_quote = filter_fresh_quotes(latest_quote, fresh_cutoff)
             runtime_names = load_names_from_db(args.db_path, tickers)
             source = f"local realtime db [{args.db_path}] [{start}..{end}]"
@@ -1342,7 +1393,7 @@ def main():
                 except RuntimeError as exc:
                     print(f"[WARN] realtime quote refresh failed, use db quote: {exc}")
                     latest_quote = load_latest_quotes_from_db(args.db_path, list(data.keys()))
-            fresh_cutoff = dt.datetime.combine(end, dt.time.min)
+            fresh_cutoff = dt.datetime.combine(end, dt.time.min, tzinfo=dt.timezone.utc)
             latest_quote = filter_fresh_quotes(latest_quote, fresh_cutoff)
 
             # 优先获取股票中文名并入库
@@ -1362,6 +1413,7 @@ def main():
     per_horizon_test: Dict[int, List[Tuple[dt.date, str, float, int]]] = {}
     metrics_rows: List[Tuple[int, int, int, float, float, float, float]] = []
     latest_dates: List[dt.date] = []
+    latest_bar_by_ticker: Dict[str, Row] = {tk: rows[-1] for tk, rows in data.items() if rows}
 
     min_samples_required = max(50, args.min_samples)
     if args.cn_etf_rotation and args.min_samples == 500:
@@ -1392,9 +1444,13 @@ def main():
             risk20 = s.features[4] if len(s.features) > 4 else 0.0
             if latest_quote and s.ticker in latest_quote:
                 px, ts = latest_quote[s.ticker]
-                src = f"live@{ts.isoformat()}Z"
+                src = format_live_src(ts)
             else:
-                px, src = s.close, f"daily@{latest_date.isoformat()}"
+                lb = latest_bar_by_ticker.get(s.ticker)
+                if lb:
+                    px, src = lb.close, f"daily@{lb.date.isoformat()}"
+                else:
+                    px, src = s.close, f"daily@{latest_date.isoformat()}"
             mapp[s.ticker] = (px, p, risk20, src)
         per_horizon_maps[h] = mapp
 
@@ -1422,9 +1478,13 @@ def main():
                     risk20 = s.features[4] if len(s.features) > 4 else 0.0
                     if latest_quote and s.ticker in latest_quote:
                         px, ts = latest_quote[s.ticker]
-                        src = f"live@{ts.isoformat()}Z"
+                        src = format_live_src(ts)
                     else:
-                        px, src = s.close, f"daily@{latest_date.isoformat()}"
+                        lb = latest_bar_by_ticker.get(s.ticker)
+                        if lb:
+                            px, src = lb.close, f"daily@{lb.date.isoformat()}"
+                        else:
+                            px, src = s.close, f"daily@{latest_date.isoformat()}"
                     mapp[s.ticker] = (px, p, risk20, src)
                 per_horizon_maps[h] = mapp
                 horizons = [h]
@@ -1445,10 +1505,7 @@ def main():
     for tk in tickers_union:
         num = 0.0
         den = 0.0
-        pick_price = 0.0
-        pick_risk = 0.0
-        pick_src = "N/A"
-        # prefer longer horizon for quote/risk display
+        picked: Optional[Tuple[float, float, str]] = None
         for h in sorted(per_horizon_maps.keys(), reverse=True):
             mp = per_horizon_maps[h]
             if tk in mp:
@@ -1456,16 +1513,20 @@ def main():
                 w_h = horizon_weight_map.get(h, 0.0)
                 num += w_h * p
                 den += w_h
-                if pick_src == "N/A":
-                    pick_price, pick_risk, pick_src = px, rk, src
+                picked = choose_latest_display_source(picked, (px, rk, src))
         if den <= 0:
             continue
-        ranked_all.append((tk, pick_price, num / den, pick_risk, pick_src))
+        if picked is None:
+            picked = (0.0, 0.0, "N/A")
+        ranked_all.append((tk, picked[0], num / den, picked[1], picked[2]))
 
     ranked_all.sort(key=lambda x: x[2], reverse=True)
     top = ranked_all[: args.topn]
     while len(top) < args.topn:
         top.append((f"N/A_{len(top)+1}", 0.0, 0.0, 0.0, "insufficient_universe"))
+    report_model_date = latest_date
+    for _tk, _px, _p, _rk, src in top:
+        report_model_date = max(report_model_date, source_to_date(src, report_model_date))
     prev_w = load_prev_weights(args.prev_weights)
     portfolio = build_portfolio(
         top,
@@ -1479,7 +1540,7 @@ def main():
     save_weights(args.save_weights, portfolio)
     report_wr, report_n = write_one_year_report(args.report_csv, horizons, horizon_weight_map, per_horizon_test)
 
-    run_ts = dt.datetime.utcnow().isoformat() + "Z"
+    run_ts = dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z")
     print("==============================================")
     print(" A/H ALPHA TERMINAL PRO v10")
     print(" Index Enhancement | Excess Return Engine")
@@ -1501,7 +1562,7 @@ def main():
     for h, trn, tst, thr, acc, prec, auc in metrics_rows:
         print(f"H{h:>2} -> Train/Test {trn:,}/{tst:,} | Thr {thr:.2f} | Acc {acc:.4f} | Prec {prec:.4f} | AUC {auc:.4f}")
     print("----------------------------------------------")
-    print(f"TOP {args.topn} CANDIDATES @ model_date={latest_date.isoformat()}")
+    print(f"TOP {args.topn} CANDIDATES @ model_date={report_model_date.isoformat()}")
     for tk, px, p, risk20, src in top:
         nm = stock_name(tk, runtime_names)
         shown = f"{tk}({nm})"

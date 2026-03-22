@@ -993,6 +993,33 @@ def stock_name(ticker: str, runtime_names: Optional[Dict[str, str]] = None) -> s
     return STOCK_NAME_MAP.get(ticker, ticker)
 
 
+def parse_int_list(s: str) -> List[int]:
+    out: List[int] = []
+    for x in s.split(","):
+        x = x.strip()
+        if not x:
+            continue
+        out.append(int(x))
+    return out
+
+
+def parse_float_list(s: str) -> List[float]:
+    out: List[float] = []
+    for x in s.split(","):
+        x = x.strip()
+        if not x:
+            continue
+        out.append(float(x))
+    return out
+
+
+def normalize_weights(ws: List[float], n: int) -> List[float]:
+    if len(ws) != n or sum(ws) <= 0:
+        return [1.0 / n] * n
+    s = sum(ws)
+    return [x / s for x in ws]
+
+
 def parse_providers(providers_str: str) -> List[str]:
     out = [p.strip().lower() for p in providers_str.split(",") if p.strip()]
     valid = {"eastmoney", "tencent", "yahoo", "stooq"}
@@ -1003,7 +1030,7 @@ def parse_providers(providers_str: str) -> List[str]:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="A/H Alpha Pro v9 (realtime DB + professional report)")
+    parser = argparse.ArgumentParser(description="A/H Alpha Pro v10 (multi-horizon ensemble for index enhancement)")
     parser.add_argument("--input-csv", type=str, default="", help="CSV path with columns: date,ticker,close,high,low,volume")
     parser.add_argument(
         "--tickers",
@@ -1014,7 +1041,9 @@ def main():
     parser.add_argument("--providers", type=str, default="eastmoney,tencent,yahoo,stooq", help="Data providers in priority order")
     parser.add_argument("--start", type=str, default="2021-01-01")
     parser.add_argument("--end", type=str, default=dt.date.today().isoformat())
-    parser.add_argument("--horizon", type=int, default=5)
+    parser.add_argument("--horizon", type=int, default=5, help="Single horizon fallback (legacy)")
+    parser.add_argument("--horizons", type=str, default="5,10,20", help="Multi-horizon labels, e.g. 5,10,20")
+    parser.add_argument("--horizon-weights", type=str, default="0.2,0.3,0.5", help="Weights for horizons")
     parser.add_argument("--topn", type=int, default=5)
     parser.add_argument("--benchmark", type=str, default="000300.SS", help="Benchmark ticker for excess-return label")
     parser.add_argument("--max-weight", type=float, default=0.35, help="Max single-stock weight in suggested portfolio")
@@ -1081,19 +1110,77 @@ def main():
             else:
                 runtime_names = load_names_from_db(args.db_path, list(data.keys()))
 
-    samples = build_samples(data, horizon=args.horizon, benchmark_ticker=args.benchmark)
-    if len(samples) < 500:
-        raise ValueError("Not enough samples. Provide more history/tickers.")
+    horizons = parse_int_list(args.horizons) or [args.horizon]
+    h_weights = normalize_weights(parse_float_list(args.horizon_weights), len(horizons))
 
-    train, test = train_test_split(samples, split_ratio=0.8)
-    x_train, y_train, x_test, y_test, means, stds = standardize(train, test)
+    per_horizon_maps: Dict[int, Dict[str, Tuple[float, float, float, str]]] = {}
+    metrics_rows: List[Tuple[int, int, int, float, float, float, float]] = []
+    latest_dates: List[dt.date] = []
 
-    w, b = train_logistic_sgd(x_train, y_train)
-    probs = predict_prob(w, b, x_test)
-    t = best_threshold(y_test, probs)
-    m = compute_metrics(y_test, probs, threshold=t)
+    for h in horizons:
+        samples_h = build_samples(data, horizon=h, benchmark_ticker=args.benchmark)
+        if len(samples_h) < 500:
+            continue
+        train, test = train_test_split(samples_h, split_ratio=0.8)
+        if not train or not test:
+            continue
+        x_train, y_train, x_test, y_test, means, stds = standardize(train, test)
+        w, b = train_logistic_sgd(x_train, y_train)
+        probs = predict_prob(w, b, x_test)
+        t = best_threshold(y_test, probs)
+        m = compute_metrics(y_test, probs, threshold=t)
+        metrics_rows.append((h, len(train), len(test), t, m.accuracy, m.precision, m.auc))
 
-    latest_date, top = rank_latest(samples, w, b, means, stds, args.topn, latest_quote=latest_quote)
+        latest_date = max(s.date for s in samples_h)
+        latest_dates.append(latest_date)
+        latest = [s for s in samples_h if s.date == latest_date]
+        mapp: Dict[str, Tuple[float, float, float, str]] = {}
+        for s in latest:
+            x = [(s.features[i] - means[i]) / stds[i] for i in range(len(means))]
+            p = sigmoid(sum(w[j] * x[j] for j in range(len(w))) + b)
+            risk20 = s.features[4] if len(s.features) > 4 else 0.0
+            if latest_quote and s.ticker in latest_quote:
+                px, ts = latest_quote[s.ticker]
+                src = f"live@{ts.isoformat()}Z"
+            else:
+                px, src = s.close, f"daily@{latest_date.isoformat()}"
+            mapp[s.ticker] = (px, p, risk20, src)
+        per_horizon_maps[h] = mapp
+
+    if not per_horizon_maps:
+        raise ValueError("Not enough samples across configured horizons.")
+
+    latest_date = max(latest_dates) if latest_dates else dt.date.today()
+    tickers_union = set()
+    for mp in per_horizon_maps.values():
+        tickers_union.update(mp.keys())
+
+    horizon_weight_map = {h: h_weights[i] for i, h in enumerate(horizons)}
+    ranked_all: List[Tuple[str, float, float, float, str]] = []
+    for tk in tickers_union:
+        num = 0.0
+        den = 0.0
+        pick_price = 0.0
+        pick_risk = 0.0
+        pick_src = "N/A"
+        # prefer longer horizon for quote/risk display
+        for h in sorted(per_horizon_maps.keys(), reverse=True):
+            mp = per_horizon_maps[h]
+            if tk in mp:
+                px, p, rk, src = mp[tk]
+                w_h = horizon_weight_map.get(h, 0.0)
+                num += w_h * p
+                den += w_h
+                if pick_src == "N/A":
+                    pick_price, pick_risk, pick_src = px, rk, src
+        if den <= 0:
+            continue
+        ranked_all.append((tk, pick_price, num / den, pick_risk, pick_src))
+
+    ranked_all.sort(key=lambda x: x[2], reverse=True)
+    top = ranked_all[: args.topn]
+    while len(top) < args.topn:
+        top.append((f"N/A_{len(top)+1}", 0.0, 0.0, 0.0, "insufficient_universe"))
     prev_w = load_prev_weights(args.prev_weights)
     portfolio = build_portfolio(
         top,
@@ -1108,7 +1195,7 @@ def main():
 
     run_ts = dt.datetime.utcnow().isoformat() + "Z"
     print("==============================================")
-    print(" A/H ALPHA TERMINAL PRO v9")
+    print(" A/H ALPHA TERMINAL PRO v10")
     print(" Index Enhancement | Excess Return Engine")
     print("==============================================")
     print(f"Run Time (UTC) : {run_ts}")
@@ -1118,12 +1205,10 @@ def main():
     print("Label Mode     : excess return > 0 (fallback: absolute return > 0)")
     print(f"Feature Set    : {', '.join(FEATURE_NAMES)}")
     print("----------------------------------------------")
-    print(f"Train/Test     : {len(train):,}/{len(test):,}")
-    print(f"Threshold      : {t:.2f}")
-    print(f"Accuracy       : {m.accuracy:.4f}")
-    print(f"Precision      : {m.precision:.4f}")
-    print(f"Recall         : {m.recall:.4f}")
-    print(f"ROC-AUC        : {m.auc:.4f}")
+    print(f"Horizons       : {horizons}")
+    print(f"HorizonWeights : {[round(x, 4) for x in h_weights]}")
+    for h, trn, tst, thr, acc, prec, auc in metrics_rows:
+        print(f"H{h:>2} -> Train/Test {trn:,}/{tst:,} | Thr {thr:.2f} | Acc {acc:.4f} | Prec {prec:.4f} | AUC {auc:.4f}")
     print("----------------------------------------------")
     print(f"TOP {args.topn} CANDIDATES @ model_date={latest_date.isoformat()}")
     for tk, px, p, risk20, src in top:

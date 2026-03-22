@@ -401,6 +401,52 @@ def fetch_latest_quote_tencent(tickers: List[str]) -> Dict[str, Tuple[float, dt.
     return out
 
 
+def fetch_stock_names_eastmoney(tickers: List[str]) -> Dict[str, str]:
+    out: Dict[str, str] = {}
+    for ticker in tickers:
+        try:
+            secid = to_eastmoney_secid(ticker)
+            params = urlencode({"fields": "f58,f57", "secid": secid})
+            url = f"https://push2.eastmoney.com/api/qt/stock/get?{params}"
+            payload = fetch_json(url)
+            data = payload.get("data") or {}
+            name = data.get("f58")
+            if isinstance(name, str) and name.strip():
+                out[ticker] = name.strip()
+        except Exception:
+            continue
+    return out
+
+
+def fetch_stock_names_tencent(tickers: List[str]) -> Dict[str, str]:
+    if not tickers:
+        return {}
+    symbols = [to_tencent_symbol(t) for t in tickers]
+    url = "https://qt.gtimg.cn/q=" + ",".join(symbols)
+    req = Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    try:
+        with urlopen(req, timeout=20) as resp:
+            text = resp.read().decode("gbk", errors="ignore")
+    except Exception:
+        return {}
+
+    inv = {to_tencent_symbol(t): t for t in tickers}
+    out: Dict[str, str] = {}
+    for ln in [x.strip() for x in text.split(";") if x.strip()]:
+        if "~" not in ln:
+            continue
+        left, right = ln.split("=", 1)
+        symbol = left.split("_")[-1].strip()
+        fields = right.strip().strip("\"").split("~")
+        if len(fields) < 2:
+            continue
+        name = fields[1].strip()
+        tk = inv.get(symbol)
+        if tk and name:
+            out[tk] = name
+    return out
+
+
 def fetch_live_data(
     tickers: List[str], start: dt.date, end: dt.date, providers: List[str]
 ) -> Dict[str, List[Row]]:
@@ -463,6 +509,15 @@ def init_db(db_path: str) -> None:
             ticker TEXT PRIMARY KEY,
             price REAL NOT NULL,
             ts_utc TEXT NOT NULL
+        )
+        """
+    )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS instrument_names (
+            ticker TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            updated_utc TEXT NOT NULL
         )
         """
     )
@@ -544,6 +599,37 @@ def load_latest_quotes_from_db(db_path: str, tickers: List[str]) -> Dict[str, Tu
         row = cur.fetchone()
         if row:
             out[tk] = (float(row[0]), dt.datetime.fromisoformat(row[1]))
+    conn.close()
+    return out
+
+
+def save_names_to_db(db_path: str, names: Dict[str, str]) -> None:
+    if not names:
+        return
+    init_db(db_path)
+    conn = sqlite3.connect(db_path)
+    cur = conn.cursor()
+    ts = dt.datetime.utcnow().isoformat()
+    for tk, nm in names.items():
+        cur.execute(
+            "INSERT OR REPLACE INTO instrument_names (ticker, name, updated_utc) VALUES (?, ?, ?)",
+            (tk, nm, ts),
+        )
+    conn.commit()
+    conn.close()
+
+
+def load_names_from_db(db_path: str, tickers: List[str]) -> Dict[str, str]:
+    if not os.path.exists(db_path):
+        return {}
+    conn = sqlite3.connect(db_path)
+    cur = conn.cursor()
+    out: Dict[str, str] = {}
+    for tk in tickers:
+        cur.execute("SELECT name FROM instrument_names WHERE ticker = ?", (tk,))
+        row = cur.fetchone()
+        if row and row[0]:
+            out[tk] = str(row[0])
     conn.close()
     return out
 
@@ -881,7 +967,9 @@ def ensure_ticker_pool_size(tickers: List[str], topn: int, benchmark: str) -> Li
     return out
 
 
-def stock_name(ticker: str) -> str:
+def stock_name(ticker: str, runtime_names: Optional[Dict[str, str]] = None) -> str:
+    if runtime_names and ticker in runtime_names and runtime_names[ticker]:
+        return runtime_names[ticker]
     return STOCK_NAME_MAP.get(ticker, ticker)
 
 
@@ -921,6 +1009,7 @@ def main():
     args = parser.parse_args()
 
     latest_quote: Dict[str, Tuple[float, dt.datetime]] = {}
+    runtime_names: Dict[str, str] = {}
 
     if args.input_csv:
         data = parse_csv(args.input_csv)
@@ -938,6 +1027,7 @@ def main():
         if args.db_only:
             data = load_history_from_db(args.db_path, tickers, start, end)
             latest_quote = load_latest_quotes_from_db(args.db_path, tickers)
+            runtime_names = load_names_from_db(args.db_path, tickers)
             source = f"local realtime db [{args.db_path}] [{start}..{end}]"
         else:
             try:
@@ -960,6 +1050,16 @@ def main():
                 except RuntimeError as exc:
                     print(f"[WARN] realtime quote refresh failed, use db quote: {exc}")
                     latest_quote = load_latest_quotes_from_db(args.db_path, list(data.keys()))
+
+            # 优先获取股票中文名并入库
+            runtime_names = fetch_stock_names_eastmoney(list(data.keys()))
+            if len(runtime_names) < len(data):
+                more = fetch_stock_names_tencent(list(data.keys()))
+                runtime_names.update({k: v for k, v in more.items() if k not in runtime_names})
+            if runtime_names:
+                save_names_to_db(args.db_path, runtime_names)
+            else:
+                runtime_names = load_names_from_db(args.db_path, list(data.keys()))
 
     samples = build_samples(data, horizon=args.horizon, benchmark_ticker=args.benchmark)
     if len(samples) < 500:
@@ -1007,14 +1107,14 @@ def main():
     print("----------------------------------------------")
     print(f"TOP {args.topn} CANDIDATES @ model_date={latest_date.isoformat()}")
     for tk, px, p, risk20, src in top:
-        nm = stock_name(tk)
+        nm = stock_name(tk, runtime_names)
         shown = f"{tk}({nm})"
         print(f"{shown:26s} px={px:10.3f} up_prob={p:.4f} risk20={risk20:.4f} [{src}]")
 
     print("----------------------------------------------")
     print("SUGGESTED PORTFOLIO (alpha+risk+cost)")
     for tk, wt, p, risk20, src in portfolio:
-        nm = stock_name(tk)
+        nm = stock_name(tk, runtime_names)
         shown = f"{tk}({nm})"
         print(f"{shown:26s} weight={wt:6.2%} up_prob={p:.4f} risk20={risk20:.4f} [{src}]")
     if args.prev_weights:

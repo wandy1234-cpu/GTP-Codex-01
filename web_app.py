@@ -48,9 +48,6 @@ PAGE = """<!doctype html>
     <label>CSV 路径（仅 csv 模式）</label>
     <input id="csv" value="C:\\Users\\Admin\\Desktop\\GTP-Codex-01" />
 
-    <label>外资投行Top5因子CSV（可选）</label>
-    <input id="institution_factor_csv" value="" placeholder="如 C:\\data\\ib_top5_factor.csv" />
-
     <div class="row">
       <div>
         <label>考虑外资投行因子</label>
@@ -137,7 +134,6 @@ async function run() {
     mode: document.getElementById('mode').value,
     topn: document.getElementById('topn').value,
     csv: document.getElementById('csv').value,
-    institution_factor_csv: document.getElementById('institution_factor_csv').value,
     use_institution_factor: document.getElementById('use_institution_factor').value,
     benchmark: document.getElementById('benchmark').value,
     providers: document.getElementById('providers').value,
@@ -212,7 +208,6 @@ class Handler(BaseHTTPRequestHandler):
         etf_live_limit = str(payload.get("etf_live_limit", "120"))
         cn_etf_limit = str(payload.get("cn_etf_limit", "200"))
         csv_path = str(payload.get("csv", "")).strip()
-        institution_factor_csv = str(payload.get("institution_factor_csv", "")).strip()
         use_institution_factor = str(payload.get("use_institution_factor", "1"))
 
         cmd = [
@@ -237,8 +232,6 @@ class Handler(BaseHTTPRequestHandler):
         ]
         if use_institution_factor == "1":
             cmd.append("--use-institution-factor")
-            if institution_factor_csv:
-                cmd.extend(["--institution-factor-csv", institution_factor_csv])
         else:
             cmd.append("--no-use-institution-factor")
 

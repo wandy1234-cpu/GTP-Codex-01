@@ -194,6 +194,7 @@ http://127.0.0.1:8000
 - TopN、benchmark、providers、max-weight、risk-aversion、cost-penalty 参数可视化配置
 - DB Path、DB Only 可视化配置（实时数据库模式）
 - 支持“是否考虑外资投行因子”下拉（默认：是）
+- Web 页不再显示“外资因子 CSV 路径”输入框；开启因子时会自动读取项目目录下 `ib_top5_factor.csv`
 - `请求超时(秒)` / `重试次数` 可视化配置（解决 live 模式超时问题）
 - CSV 路径默认预填：`C:\Users\Admin\Desktop\GTP-Codex-01`
 - 在线展示 `quant_alpha_system.py` 的完整输出

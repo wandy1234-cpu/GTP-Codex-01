@@ -79,6 +79,27 @@ run_alpha_windows.bat csv your_ah_data.csv
 - 自动维护 `outputs\latest_portfolio.csv` 作为下一次的 `--prev-weights`
 - `live` 模式默认用大陆优先数据源：`eastmoney,tencent,yahoo,stooq`
 
+## 5.2) 网页版控制台（推荐）
+
+项目提供了 `web_app.py`，可在浏览器中配置参数并运行策略。
+
+启动：
+
+```bash
+python web_app.py
+```
+
+打开：
+
+```
+http://127.0.0.1:8000
+```
+
+页面支持：
+- `demo` / `live` / `csv` 三种模式
+- TopN、benchmark、providers、max-weight、risk-aversion、cost-penalty 参数可视化配置
+- 在线展示 `quant_alpha_system.py` 的完整输出
+
 ## 6) 这次算法/工程升级点
 
 - 新增 Eastmoney（东财）实时 quote 接口（实时价格 + 时间戳）

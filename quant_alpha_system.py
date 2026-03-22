@@ -1116,6 +1116,39 @@ def write_one_year_report(
     return overall_wr, total_sel
 
 
+def auto_tune_horizon_weights(
+    horizons: List[int],
+    per_horizon_test: Dict[int, List[Tuple[dt.date, str, float, int]]],
+) -> List[float]:
+    """
+    根据每个周期在测试集上 top20% 的胜率自动分配融合权重。
+    权重分数 = max(win_rate - 0.5, 0.0001) * log(1 + selected_count)
+    """
+    scores: List[float] = []
+    for h in horizons:
+        recs = per_horizon_test.get(h, [])
+        if not recs:
+            scores.append(0.0)
+            continue
+        by_day: Dict[dt.date, List[Tuple[float, int]]] = defaultdict(list)
+        for d, _tk, p, y in recs:
+            by_day[d].append((p, y))
+        total_sel = 0
+        total_win = 0
+        for d in by_day:
+            arr = sorted(by_day[d], key=lambda x: x[0], reverse=True)
+            n = max(1, int(len(arr) * 0.2))
+            sel = arr[:n]
+            wins = sum(1 for _p, y in sel if y == 1)
+            total_sel += n
+            total_win += wins
+        wr = (total_win / total_sel) if total_sel else 0.0
+        edge = max(wr - 0.5, 0.0001)
+        score = edge * math.log1p(total_sel)
+        scores.append(score)
+    return normalize_weights(scores, len(horizons))
+
+
 def parse_providers(providers_str: str) -> List[str]:
     out = [p.strip().lower() for p in providers_str.split(",") if p.strip()]
     valid = {"eastmoney", "tencent", "yahoo", "stooq"}
@@ -1140,6 +1173,11 @@ def main():
     parser.add_argument("--horizon", type=int, default=5, help="Single horizon fallback (legacy)")
     parser.add_argument("--horizons", type=str, default="5,10,20", help="Multi-horizon labels, e.g. 5,10,20")
     parser.add_argument("--horizon-weights", type=str, default="0.2,0.3,0.5", help="Weights for horizons")
+    parser.add_argument(
+        "--auto-tune-horizon-weights",
+        action="store_true",
+        help="Auto-tune horizon fusion weights from backtest win-rate on the holdout split.",
+    )
     parser.add_argument("--topn", type=int, default=5)
     parser.add_argument("--benchmark", type=str, default="000300.SS", help="Benchmark ticker for excess-return label")
     parser.add_argument("--max-weight", type=float, default=0.35, help="Max single-stock weight in suggested portfolio")
@@ -1260,6 +1298,8 @@ def main():
     for mp in per_horizon_maps.values():
         tickers_union.update(mp.keys())
 
+    if args.auto_tune_horizon_weights:
+        h_weights = auto_tune_horizon_weights(horizons, per_horizon_test)
     horizon_weight_map = {h: h_weights[i] for i, h in enumerate(horizons)}
     ranked_all: List[Tuple[str, float, float, float, str]] = []
     for tk in tickers_union:
@@ -1313,6 +1353,8 @@ def main():
     print("----------------------------------------------")
     print(f"Horizons       : {horizons}")
     print(f"HorizonWeights : {[round(x, 4) for x in h_weights]}")
+    if args.auto_tune_horizon_weights:
+        print("HorizonWeightMode : auto_tuned_from_holdout")
     for h, trn, tst, thr, acc, prec, auc in metrics_rows:
         print(f"H{h:>2} -> Train/Test {trn:,}/{tst:,} | Thr {thr:.2f} | Acc {acc:.4f} | Prec {prec:.4f} | AUC {auc:.4f}")
     print("----------------------------------------------")

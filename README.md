@@ -34,6 +34,7 @@ python quant_alpha_system.py
 - `--db-only`（仅使用本地数据库运行，不访问网络）
 - `--horizons 5,10,20`（多标签周期）
 - `--horizon-weights 0.2,0.3,0.5`（多标签融合权重）
+- `--auto-tune-horizon-weights`（根据 holdout 回测胜率自动反推多周期融合权重）
 - `--report-csv one_year_report.csv`（导出近1年每日胜率报告）
 - 会尝试实时 quote 刷新；失败则回退到最新日线
 - 为避免 `--db-only` 与联网模式因“陈旧实时价”产生偏差，程序仅使用不早于 `--end` 当天 00:00(UTC) 的 quote，过旧 quote 自动忽略并回退日线收盘价
@@ -61,6 +62,17 @@ python quant_alpha_system.py \
 ```bash
 python quant_alpha_system.py --no-realtime
 ```
+
+## 3.1) 根据回测结果反向优化模型（自动调融合权重）
+
+```bash
+python quant_alpha_system.py --horizons 5,10,20 --auto-tune-horizon-weights
+```
+
+说明：
+- 对每个 horizon，在 holdout 测试集上统计 top20% 组合胜率；
+- 用 `max(胜率-0.5, 0.0001) * log(1+样本数)` 计算分数并归一化为权重；
+- 适合作为“先验自动调参”，建议再做样本外窗口复核。
 
 ## 4) 使用你自己的 CSV
 
@@ -135,3 +147,12 @@ http://127.0.0.1:8000
 - 交易成本 + 冲击成本
 - walk-forward 稳定性检验
 - 组合优化层：`max(alpha - 风险惩罚 - 成本惩罚)`
+
+## 8) 这个模型适不适合 ETF？
+
+可以，但更适合 **ETF轮动/ETF增强**，不建议把它当作单只ETF择时的万能模型。实务建议：
+- `--tickers` 直接给 ETF 池（宽基/行业/主题）；
+- `--benchmark` 用宽基或你策略对应基准；
+- 优先中周期权重（如 `10/20`），降低超短周期噪声；
+- 适当提高 `--cost-penalty`，防止ETF高换手吞噬超额；
+- 结合成交额/规模约束，避免冷门ETF滑点。

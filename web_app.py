@@ -14,7 +14,7 @@ PAGE = """<!doctype html>
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>A/H Alpha Web 控制台</title>
+  <title>A/H Alpha Web 控制台（Pro v10）</title>
   <style>
     body { font-family: Arial, sans-serif; margin: 24px; max-width: 980px; }
     .card { border: 1px solid #ddd; border-radius: 10px; padding: 16px; margin-bottom: 16px; }
@@ -26,7 +26,7 @@ PAGE = """<!doctype html>
   </style>
 </head>
 <body>
-  <h1>A/H Alpha Web 控制台（Pro v9）</h1>
+  <h1>A/H Alpha Web 控制台（Pro v10）</h1>
   <div class="card">
     <div class="row">
       <div>

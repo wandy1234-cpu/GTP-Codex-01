@@ -42,6 +42,7 @@ python quant_alpha_system.py
 - `--min-samples 500`（每个 horizon 最低样本门槛；ETF 模式默认自动放宽到 180）
 - `--report-csv one_year_report.csv`（导出近1年每日胜率报告）
 - `--institution-factor-csv ib_top5_factor.csv`（可选：外资投行 Top5 持仓因子，列为 `date,ticker,score`）
+- `--use-institution-factor`（默认开启；若未指定路径会自动尝试读取当前目录 `ib_top5_factor.csv`）
 - 会尝试实时 quote 刷新；失败则回退到最新日线
 - 为避免 `--db-only` 与联网模式因“陈旧实时价”产生偏差，程序仅使用不早于 `--end` 当天 00:00(UTC) 的 quote，过旧 quote 自动忽略并回退日线收盘价
 - 联网模式会在多数据源中优先选“最新日期”的日线数据，并过滤掉明显过旧（默认落后超过 7 天）的数据源结果
@@ -192,6 +193,7 @@ http://127.0.0.1:8000
 - `demo` / `live` / `csv` 三种模式
 - TopN、benchmark、providers、max-weight、risk-aversion、cost-penalty 参数可视化配置
 - DB Path、DB Only 可视化配置（实时数据库模式）
+- 支持“是否考虑外资投行因子”下拉（默认：是）
 - `请求超时(秒)` / `重试次数` 可视化配置（解决 live 模式超时问题）
 - CSV 路径默认预填：`C:\Users\Admin\Desktop\GTP-Codex-01`
 - 在线展示 `quant_alpha_system.py` 的完整输出

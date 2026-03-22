@@ -1356,6 +1356,19 @@ def main():
         default="",
         help="Optional CSV with columns date,ticker,score for top-5 foreign IB holdings factor",
     )
+    parser.set_defaults(use_institution_factor=True)
+    parser.add_argument(
+        "--use-institution-factor",
+        dest="use_institution_factor",
+        action="store_true",
+        help="Enable top-5 foreign IB holdings factor (default ON).",
+    )
+    parser.add_argument(
+        "--no-use-institution-factor",
+        dest="use_institution_factor",
+        action="store_false",
+        help="Disable top-5 foreign IB holdings factor.",
+    )
     parser.add_argument(
         "--tickers",
         type=str,
@@ -1432,8 +1445,17 @@ def main():
     runtime_names: Dict[str, str] = {}
     institutional_factor: Dict[str, List[Tuple[dt.date, float]]] = {}
 
-    if args.institution_factor_csv:
-        institutional_factor = load_institutional_factor_csv(args.institution_factor_csv)
+    if args.use_institution_factor:
+        factor_path = args.institution_factor_csv.strip()
+        if not factor_path and os.path.exists("ib_top5_factor.csv"):
+            factor_path = "ib_top5_factor.csv"
+        if factor_path:
+            institutional_factor = load_institutional_factor_csv(factor_path)
+            args.institution_factor_csv = factor_path
+        else:
+            print("[WARN] Institutional factor is ON but no factor CSV found. Continue without this factor.")
+    else:
+        args.institution_factor_csv = ""
 
     if args.input_csv:
         data = parse_csv(args.input_csv)

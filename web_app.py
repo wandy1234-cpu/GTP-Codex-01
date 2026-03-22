@@ -53,6 +53,17 @@ PAGE = """<!doctype html>
 
     <div class="row">
       <div>
+        <label>考虑外资投行因子</label>
+        <select id="use_institution_factor">
+          <option value="1">是（默认）</option>
+          <option value="0">否</option>
+        </select>
+      </div>
+      <div></div>
+    </div>
+
+    <div class="row">
+      <div>
         <label>Benchmark</label>
         <input id="benchmark" value="000300.SS" />
       </div>
@@ -127,6 +138,7 @@ async function run() {
     topn: document.getElementById('topn').value,
     csv: document.getElementById('csv').value,
     institution_factor_csv: document.getElementById('institution_factor_csv').value,
+    use_institution_factor: document.getElementById('use_institution_factor').value,
     benchmark: document.getElementById('benchmark').value,
     providers: document.getElementById('providers').value,
     max_weight: document.getElementById('max_weight').value,
@@ -201,6 +213,7 @@ class Handler(BaseHTTPRequestHandler):
         cn_etf_limit = str(payload.get("cn_etf_limit", "200"))
         csv_path = str(payload.get("csv", "")).strip()
         institution_factor_csv = str(payload.get("institution_factor_csv", "")).strip()
+        use_institution_factor = str(payload.get("use_institution_factor", "1"))
 
         cmd = [
             "python",
@@ -222,8 +235,12 @@ class Handler(BaseHTTPRequestHandler):
             "--request-retries",
             request_retries,
         ]
-        if institution_factor_csv:
-            cmd.extend(["--institution-factor-csv", institution_factor_csv])
+        if use_institution_factor == "1":
+            cmd.append("--use-institution-factor")
+            if institution_factor_csv:
+                cmd.extend(["--institution-factor-csv", institution_factor_csv])
+        else:
+            cmd.append("--no-use-institution-factor")
 
         if mode == "demo":
             cmd.append("--demo")

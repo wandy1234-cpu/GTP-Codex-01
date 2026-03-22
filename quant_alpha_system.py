@@ -1456,9 +1456,23 @@ def main():
                 runtime_names = load_names_from_db(args.db_path, list(data.keys()))
 
     aligned_to: Optional[dt.date] = None
+    db_aligned_to: Optional[dt.date] = None
+    using_stable_db_snapshot = False
     if args.common_date_align:
         cov = min(max(args.common_date_coverage, 0.5), 1.0)
+        if not args.input_csv and not args.demo:
+            # Baseline snapshot from DB for stability comparison.
+            db_view = load_history_from_db(args.db_path, list(data.keys()), dt.date(1990, 1, 1), dt.date.today())
+            if db_view:
+                _, db_aligned_to = align_data_to_common_date(db_view, min_coverage_ratio=cov)
         data, aligned_to = align_data_to_common_date(data, min_coverage_ratio=cov)
+        # If online refresh produced an older aligned date than existing DB snapshot,
+        # keep DB snapshot to avoid large run-to-run drift.
+        if (not args.db_only) and db_aligned_to and aligned_to and aligned_to < db_aligned_to:
+            db_view = load_history_from_db(args.db_path, list(data.keys()), dt.date(1990, 1, 1), dt.date.today())
+            if db_view:
+                data, aligned_to = align_data_to_common_date(db_view, min_coverage_ratio=cov)
+                using_stable_db_snapshot = True
 
     horizons = parse_int_list(args.horizons) or [args.horizon]
     h_weights = normalize_weights(parse_float_list(args.horizon_weights), len(horizons))
@@ -1603,6 +1617,8 @@ def main():
     print(f"Data Source    : {source}")
     if aligned_to:
         print(f"Data Align     : common_date={aligned_to.isoformat()} (coverage>={min(max(args.common_date_coverage, 0.5), 1.0):.0%})")
+    if using_stable_db_snapshot:
+        print("Stability Mode : ON (kept DB snapshot because online refresh looked older)")
     print(f"Realtime DB    : {args.db_path}")
     print(f"DB Only Mode   : {'ON' if args.db_only else 'OFF'}")
     if args.cn_etf_rotation:

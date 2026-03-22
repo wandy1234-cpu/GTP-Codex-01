@@ -1020,6 +1020,66 @@ def normalize_weights(ws: List[float], n: int) -> List[float]:
     return [x / s for x in ws]
 
 
+def write_one_year_report(
+    path: str,
+    horizons: List[int],
+    horizon_weight_map: Dict[int, float],
+    per_horizon_test: Dict[int, List[Tuple[dt.date, str, float, int]]],
+) -> Tuple[float, int]:
+    """
+    返回 (overall_win_rate, total_selected)
+    """
+    if not path:
+        return 0.0, 0
+
+    # 聚合多周期测试集概率
+    from collections import defaultdict
+
+    agg_num = defaultdict(float)
+    agg_den = defaultdict(float)
+    labels: Dict[Tuple[dt.date, str], int] = {}
+    for h in horizons:
+        recs = per_horizon_test.get(h, [])
+        w = horizon_weight_map.get(h, 0.0)
+        for d, tk, p, y in recs:
+            k = (d, tk)
+            agg_num[k] += w * p
+            agg_den[k] += w
+            labels[k] = y
+
+    by_day: Dict[dt.date, List[Tuple[float, int]]] = defaultdict(list)
+    for k, num in agg_num.items():
+        den = agg_den[k]
+        if den <= 0:
+            continue
+        p = num / den
+        by_day[k[0]].append((p, labels.get(k, 0)))
+
+    rows = []
+    total_sel = 0
+    total_win = 0
+    for d in sorted(by_day.keys()):
+        arr = by_day[d]
+        arr.sort(key=lambda x: x[0], reverse=True)
+        n = max(1, int(len(arr) * 0.2))  # top20%
+        sel = arr[:n]
+        wins = sum(1 for p, y in sel if y == 1)
+        wr = wins / n if n else 0.0
+        total_sel += n
+        total_win += wins
+        rows.append((d.isoformat(), n, wins, wr))
+
+    overall_wr = (total_win / total_sel) if total_sel else 0.0
+    with open(path, "w", encoding="utf-8", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["date", "selected_count", "wins", "daily_win_rate"])
+        w.writerows(rows)
+        w.writerow([])
+        w.writerow(["overall", total_sel, total_win, f"{overall_wr:.6f}"])
+
+    return overall_wr, total_sel
+
+
 def parse_providers(providers_str: str) -> List[str]:
     out = [p.strip().lower() for p in providers_str.split(",") if p.strip()]
     valid = {"eastmoney", "tencent", "yahoo", "stooq"}
@@ -1051,6 +1111,7 @@ def main():
     parser.add_argument("--cost-penalty", type=float, default=0.10, help="Penalty coefficient for turnover proxy in scoring")
     parser.add_argument("--prev-weights", type=str, default="", help="Previous portfolio weights CSV path (ticker,weight)")
     parser.add_argument("--save-weights", type=str, default="", help="Output CSV path to save new suggested weights")
+    parser.add_argument("--report-csv", type=str, default="", help="Export one-year backtest daily win-rate report CSV")
     parser.add_argument("--db-path", type=str, default="alpha_realtime.db", help="SQLite path for realtime/history cache")
     parser.add_argument("--db-only", action="store_true", help="Run using local realtime database only (no network fetch)")
     parser.add_argument("--demo", action="store_true", help="Force synthetic demo data")
@@ -1114,6 +1175,7 @@ def main():
     h_weights = normalize_weights(parse_float_list(args.horizon_weights), len(horizons))
 
     per_horizon_maps: Dict[int, Dict[str, Tuple[float, float, float, str]]] = {}
+    per_horizon_test: Dict[int, List[Tuple[dt.date, str, float, int]]] = {}
     metrics_rows: List[Tuple[int, int, int, float, float, float, float]] = []
     latest_dates: List[dt.date] = []
 
@@ -1130,6 +1192,7 @@ def main():
         t = best_threshold(y_test, probs)
         m = compute_metrics(y_test, probs, threshold=t)
         metrics_rows.append((h, len(train), len(test), t, m.accuracy, m.precision, m.auc))
+        per_horizon_test[h] = [(row.date, row.ticker, pp, yy) for row, pp, yy in zip(test, probs, y_test)]
 
         latest_date = max(s.date for s in samples_h)
         latest_dates.append(latest_date)
@@ -1192,6 +1255,7 @@ def main():
     new_w = {tk: wt for tk, wt, _, _, _ in portfolio}
     turnover = estimate_turnover(prev_w, new_w) if prev_w else 0.0
     save_weights(args.save_weights, portfolio)
+    report_wr, report_n = write_one_year_report(args.report_csv, horizons, horizon_weight_map, per_horizon_test)
 
     run_ts = dt.datetime.utcnow().isoformat() + "Z"
     print("==============================================")
@@ -1226,6 +1290,9 @@ def main():
         print(f"Estimated turnover vs prev portfolio: {turnover:.2%}")
     if args.save_weights:
         print(f"Saved new weights to: {args.save_weights}")
+    if args.report_csv:
+        print(f"Saved report CSV : {args.report_csv}")
+        print(f"One-year Top20% win rate: {report_wr:.4f} (n={report_n})")
 
 
 if __name__ == "__main__":

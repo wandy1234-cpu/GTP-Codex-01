@@ -34,6 +34,7 @@ python quant_alpha_system.py
 - `--db-only`（仅使用本地数据库运行，不访问网络）
 - `--horizons 5,10,20`（多标签周期）
 - `--horizon-weights 0.2,0.3,0.5`（多标签融合权重）
+- `--report-csv one_year_report.csv`（导出近1年每日胜率报告）
 - 会尝试实时 quote 刷新；失败则回退到最新日线
 
 ## 2) 指定数据窗口与股票池

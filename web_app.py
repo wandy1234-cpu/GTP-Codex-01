@@ -8,6 +8,7 @@ from urllib.parse import parse_qs, urlparse
 
 HOST = "127.0.0.1"
 PORT = 8000
+STRATEGY_TIMEOUT_SECONDS = 240
 
 PAGE = """<!doctype html>
 <html lang="zh-CN">
@@ -60,6 +61,17 @@ PAGE = """<!doctype html>
 
     <div class="row">
       <div>
+        <label>请求超时(秒)</label>
+        <input id="request_timeout" value="8" />
+      </div>
+      <div>
+        <label>重试次数</label>
+        <input id="request_retries" value="1" />
+      </div>
+    </div>
+
+    <div class="row">
+      <div>
         <label>Max Weight</label>
         <input id="max_weight" value="0.20" />
       </div>
@@ -107,6 +119,8 @@ async function run() {
     cost_penalty: document.getElementById('cost_penalty').value,
     db_path: document.getElementById('db_path').value,
     db_only: document.getElementById('db_only').value,
+    request_timeout: document.getElementById('request_timeout').value,
+    request_retries: document.getElementById('request_retries').value,
   };
 
   document.getElementById('out').textContent = '运行中...';
@@ -164,6 +178,8 @@ class Handler(BaseHTTPRequestHandler):
         cost_penalty = str(payload.get("cost_penalty", "0.10"))
         db_path = str(payload.get("db_path", "alpha_realtime.db"))
         db_only = str(payload.get("db_only", "0"))
+        request_timeout = str(payload.get("request_timeout", "8"))
+        request_retries = str(payload.get("request_retries", "1"))
         csv_path = str(payload.get("csv", "")).strip()
 
         cmd = [
@@ -181,6 +197,10 @@ class Handler(BaseHTTPRequestHandler):
             cost_penalty,
             "--db-path",
             db_path,
+            "--request-timeout",
+            request_timeout,
+            "--request-retries",
+            request_retries,
         ]
 
         if mode == "demo":
@@ -207,11 +227,14 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         try:
-            p = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+            p = subprocess.run(cmd, capture_output=True, text=True, timeout=STRATEGY_TIMEOUT_SECONDS)
             output = (p.stdout or "") + ("\n" + p.stderr if p.stderr else "")
             self._send_json({"output": output, "returncode": p.returncode})
         except subprocess.TimeoutExpired:
-            self._send_json({"error": "运行超时（120秒）"}, 500)
+            self._send_json(
+                {"error": f"运行超时（{STRATEGY_TIMEOUT_SECONDS}秒）: 请缩小股票池、降低重试次数，或改用 DB Only。"},
+                500,
+            )
 
 
 def main():

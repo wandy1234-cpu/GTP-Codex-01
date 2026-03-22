@@ -16,6 +16,9 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
+NETWORK_TIMEOUT_SECONDS = 12
+NETWORK_RETRIES = 2
+
 
 @dataclass
 class Row:
@@ -129,7 +132,9 @@ def parse_csv(path: str) -> Dict[str, List[Row]]:
     return by_ticker
 
 
-def fetch_json(url: str, timeout: int = 20, retries: int = 3) -> dict:
+def fetch_json(url: str, timeout: Optional[int] = None, retries: Optional[int] = None) -> dict:
+    timeout = NETWORK_TIMEOUT_SECONDS if timeout is None else timeout
+    retries = NETWORK_RETRIES if retries is None else retries
     req = Request(url, headers={"User-Agent": "Mozilla/5.0"})
     last_exc: Exception | None = None
 
@@ -515,7 +520,7 @@ def fetch_cn_etf_universe_eastmoney(limit: int = 2000) -> List[str]:
 
 
 def fetch_live_data(
-    tickers: List[str], start: dt.date, end: dt.date, providers: List[str]
+    tickers: List[str], start: dt.date, end: dt.date, providers: List[str], fast_mode: bool = True
 ) -> Dict[str, List[Row]]:
     data: Dict[str, List[Row]] = defaultdict(list)
     errors: List[str] = []
@@ -542,6 +547,10 @@ def fetch_live_data(
                     if (last_date > best_last_date) or (last_date == best_last_date and len(rows) > len(best_rows)):
                         best_rows = rows
                         best_last_date = last_date
+                    if fast_mode and last_date >= stale_cutoff:
+                        # Low-latency mode: if one provider already has fresh enough data,
+                        # stop querying remaining providers for this ticker.
+                        break
             except RuntimeError as exc:
                 errors.append(f"{provider}:{t}: {exc}")
 
@@ -1250,7 +1259,18 @@ def main():
     parser.add_argument("--demo", action="store_true", help="Force synthetic demo data")
     parser.add_argument("--no-realtime", action="store_true", help="Disable realtime quote refresh")
     parser.add_argument("--min-samples", type=int, default=500, help="Minimum sample count required per horizon")
+    parser.add_argument("--request-timeout", type=int, default=12, help="Per-request timeout seconds for online providers")
+    parser.add_argument("--request-retries", type=int, default=2, help="Retry count for online provider requests")
+    parser.add_argument(
+        "--full-provider-scan",
+        action="store_true",
+        help="Query every provider per ticker (slower). Default is fast mode: stop when fresh data is found.",
+    )
     args = parser.parse_args()
+
+    global NETWORK_TIMEOUT_SECONDS, NETWORK_RETRIES
+    NETWORK_TIMEOUT_SECONDS = max(3, int(args.request_timeout))
+    NETWORK_RETRIES = max(1, int(args.request_retries))
 
     latest_quote: Dict[str, Tuple[float, dt.datetime]] = {}
     runtime_names: Dict[str, str] = {}
@@ -1289,7 +1309,7 @@ def main():
             source = f"local realtime db [{args.db_path}] [{start}..{end}]"
         else:
             try:
-                live_data = fetch_live_data(tickers, start, end, providers)
+                live_data = fetch_live_data(tickers, start, end, providers, fast_mode=(not args.full_provider_scan))
                 source = f"latest daily via {providers} [{start}..{end}]"
                 db_data = load_history_from_db(args.db_path, tickers, start, end)
                 data = merge_with_db_history(live_data, db_data)

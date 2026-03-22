@@ -153,6 +153,7 @@ http://127.0.0.1:8000
 - `demo` / `live` / `csv` 三种模式
 - TopN、benchmark、providers、max-weight、risk-aversion、cost-penalty 参数可视化配置
 - DB Path、DB Only 可视化配置（实时数据库模式）
+- `请求超时(秒)` / `重试次数` 可视化配置（解决 live 模式超时问题）
 - CSV 路径默认预填：`C:\Users\Admin\Desktop\GTP-Codex-01`
 - 在线展示 `quant_alpha_system.py` 的完整输出
 
@@ -163,6 +164,7 @@ http://127.0.0.1:8000
 - 新增 Tencent（腾讯）历史日线与实时 quote 备用接口（大陆源）
 - 新增 Stooq 历史日线兜底源
 - 提供 `--providers` 自定义抓取优先级
+- 新增 `--request-timeout` / `--request-retries` / `--full-provider-scan`，默认启用低延迟拉取（拿到新鲜数据即停止继续扫描 provider）
 - 新增 `--benchmark`，标签改为超额收益方向（指数增强更实用）
 - 新增 `--max-weight` 与组合权重输出（从“选股”升级到“组合建议”）
 - 新增 `--risk-aversion` / `--cost-penalty` / `--prev-weights` / `--save-weights`

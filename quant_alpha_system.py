@@ -708,6 +708,36 @@ def merge_with_db_history(
     return out
 
 
+def align_data_to_common_date(
+    data: Dict[str, List[Row]],
+    min_coverage_ratio: float = 0.85,
+) -> Tuple[Dict[str, List[Row]], Optional[dt.date]]:
+    """
+    Stabilize cross-sectional runs by aligning all tickers to a common effective end date.
+    We pick the latest date D such that at least `min_coverage_ratio` tickers have data up to D.
+    Then each ticker is trimmed to rows <= D.
+    """
+    if not data:
+        return data, None
+    last_dates = {tk: rows[-1].date for tk, rows in data.items() if rows}
+    if not last_dates:
+        return data, None
+    n = len(last_dates)
+    candidates = sorted(set(last_dates.values()))
+    target = candidates[-1]
+    for d in reversed(candidates):
+        covered = sum(1 for ld in last_dates.values() if ld >= d)
+        if covered / n >= min_coverage_ratio:
+            target = d
+            break
+    out: Dict[str, List[Row]] = {}
+    for tk, rows in data.items():
+        kept = [r for r in rows if r.date <= target]
+        if kept:
+            out[tk] = kept
+    return out, target
+
+
 def filter_fresh_quotes(
     quotes: Dict[str, Tuple[float, dt.datetime]],
     min_ts_utc: dt.datetime,
@@ -1323,6 +1353,25 @@ def main():
         action="store_true",
         help="Query every provider per ticker (slower). Default is fast mode: stop when fresh data is found.",
     )
+    parser.set_defaults(common_date_align=True)
+    parser.add_argument(
+        "--common-date-align",
+        dest="common_date_align",
+        action="store_true",
+        help="Align all tickers to a common effective latest date to reduce run-to-run drift (default).",
+    )
+    parser.add_argument(
+        "--no-common-date-align",
+        dest="common_date_align",
+        action="store_false",
+        help="Disable common-date alignment.",
+    )
+    parser.add_argument(
+        "--common-date-coverage",
+        type=float,
+        default=0.85,
+        help="Coverage ratio used by common-date alignment (0~1).",
+    )
     args = parser.parse_args()
 
     global NETWORK_TIMEOUT_SECONDS, NETWORK_RETRIES
@@ -1405,6 +1454,11 @@ def main():
                 save_names_to_db(args.db_path, runtime_names)
             else:
                 runtime_names = load_names_from_db(args.db_path, list(data.keys()))
+
+    aligned_to: Optional[dt.date] = None
+    if args.common_date_align:
+        cov = min(max(args.common_date_coverage, 0.5), 1.0)
+        data, aligned_to = align_data_to_common_date(data, min_coverage_ratio=cov)
 
     horizons = parse_int_list(args.horizons) or [args.horizon]
     h_weights = normalize_weights(parse_float_list(args.horizon_weights), len(horizons))
@@ -1547,6 +1601,8 @@ def main():
     print("==============================================")
     print(f"Run Time (UTC) : {run_ts}")
     print(f"Data Source    : {source}")
+    if aligned_to:
+        print(f"Data Align     : common_date={aligned_to.isoformat()} (coverage>={min(max(args.common_date_coverage, 0.5), 1.0):.0%})")
     print(f"Realtime DB    : {args.db_path}")
     print(f"DB Only Mode   : {'ON' if args.db_only else 'OFF'}")
     if args.cn_etf_rotation:

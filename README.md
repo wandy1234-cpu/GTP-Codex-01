@@ -172,6 +172,7 @@ http://127.0.0.1:8000
 - 新增 Stooq 历史日线兜底源
 - 提供 `--providers` 自定义抓取优先级
 - 新增 `--request-timeout` / `--request-retries` / `--full-provider-scan`，默认启用低延迟拉取（拿到新鲜数据即停止继续扫描 provider）
+- 新增 `--common-date-align`（默认开启）与 `--common-date-coverage`，将截面按共同最新日期对齐，减少同日重复运行时的漂移
 - 新增 `--benchmark`，标签改为超额收益方向（指数增强更实用）
 - 新增 `--max-weight` 与组合权重输出（从“选股”升级到“组合建议”）
 - 新增 `--risk-aversion` / `--cost-penalty` / `--prev-weights` / `--save-weights`

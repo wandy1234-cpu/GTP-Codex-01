@@ -136,6 +136,18 @@ date,ticker,score
 python quant_alpha_system.py --input-csv your_ah_data.csv --institution-factor-csv ib_top5_factor.csv --topn 10
 ```
 
+你也可以用仓库内置脚本把“原始投行持仓明细”快速转成模型可用因子：
+
+```bash
+python build_ib_top5_factor.py --input raw_ib_holdings.csv --output ib_top5_factor.csv --top-k 5
+```
+
+`raw_ib_holdings.csv` 至少要有：
+- `date`（YYYY-MM-DD）
+- `ticker`
+- `broker`
+- `position_weight`（或 `signal_score`）
+
 ## 5) 离线演示模式
 
 ```bash

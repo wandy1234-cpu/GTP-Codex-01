@@ -80,8 +80,8 @@ PAGE = """<!doctype html>
       <div>
         <label>DB Only</label>
         <select id="db_only">
-          <option value="0">否</option>
-          <option value="1">是（仅本地实时库）</option>
+          <option value="1">是（仅本地实时库，推荐）</option>
+          <option value="0">否（允许联网刷新）</option>
         </select>
       </div>
     </div>
@@ -189,10 +189,14 @@ class Handler(BaseHTTPRequestHandler):
             cmd.extend(["--providers", providers])
             if db_only == "1":
                 cmd.append("--db-only")
+            else:
+                cmd.append("--no-db-only")
         elif mode == "etf":
             cmd.extend(["--providers", providers, "--cn-etf-rotation", "--auto-tune-horizon-weights"])
             if db_only == "1":
                 cmd.append("--db-only")
+            else:
+                cmd.append("--no-db-only")
         elif mode == "csv":
             if not csv_path:
                 self._send_json({"error": "csv 模式必须填写 csv 路径"}, 400)

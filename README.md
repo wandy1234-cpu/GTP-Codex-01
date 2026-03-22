@@ -31,7 +31,8 @@ python quant_alpha_system.py
 - `--prev-weights prev.csv`（上一期权重，估算换手）
 - `--save-weights out.csv`（保存本期建议权重）
 - `--db-path alpha_realtime.db`（实时数据库路径）
-- `--db-only`（仅使用本地数据库运行，不访问网络）
+- `--db-only`（仅使用本地数据库运行，不访问网络，**默认开启**）
+- `--no-db-only`（允许联网拉取/刷新数据）
 - `--cn-etf-rotation`（启用大陆 ETF 轮动模式：自动拉取沪深 ETF 池）
 - `--cn-etf-limit 800`（大陆 ETF 池拉取上限）
 - `--horizons 5,10,20`（多标签周期）
@@ -40,6 +41,7 @@ python quant_alpha_system.py
 - `--report-csv one_year_report.csv`（导出近1年每日胜率报告）
 - 会尝试实时 quote 刷新；失败则回退到最新日线
 - 为避免 `--db-only` 与联网模式因“陈旧实时价”产生偏差，程序仅使用不早于 `--end` 当天 00:00(UTC) 的 quote，过旧 quote 自动忽略并回退日线收盘价
+- 联网模式会在多数据源中优先选“最新日期”的日线数据，并过滤掉明显过旧（默认落后超过 7 天）的数据源结果
 
 ## 2) 指定数据窗口与股票池
 
@@ -63,6 +65,12 @@ python quant_alpha_system.py \
 
 ```bash
 python quant_alpha_system.py --no-realtime
+```
+
+如果你想临时允许联网刷新（覆盖默认 DB-Only），加：
+
+```bash
+python quant_alpha_system.py --no-db-only
 ```
 
 ## 3.1) 根据回测结果反向优化模型（自动调融合权重）

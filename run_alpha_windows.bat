@@ -27,11 +27,11 @@ if /I "%MODE%"=="demo" (
 )
 
 if /I "%MODE%"=="live" (
-  echo [INFO] Running LIVE mode with mainland-first providers...
+  echo [INFO] Running LIVE mode (DB-Only default) with mainland-first providers...
   if exist "%PREV_FILE%" (
-    %PYTHON_BIN% %SCRIPT% --providers eastmoney,tencent,yahoo,stooq --benchmark 000300.SS --topn 20 --max-weight 0.20 --risk-aversion 0.20 --cost-penalty 0.10 --prev-weights "%PREV_FILE%" --save-weights "%OUT_FILE%"
+    %PYTHON_BIN% %SCRIPT% --db-only --providers eastmoney,tencent,yahoo,stooq --benchmark 000300.SS --topn 20 --max-weight 0.20 --risk-aversion 0.20 --cost-penalty 0.10 --prev-weights "%PREV_FILE%" --save-weights "%OUT_FILE%"
   ) else (
-    %PYTHON_BIN% %SCRIPT% --providers eastmoney,tencent,yahoo,stooq --benchmark 000300.SS --topn 20 --max-weight 0.20 --risk-aversion 0.20 --cost-penalty 0.10 --save-weights "%OUT_FILE%"
+    %PYTHON_BIN% %SCRIPT% --db-only --providers eastmoney,tencent,yahoo,stooq --benchmark 000300.SS --topn 20 --max-weight 0.20 --risk-aversion 0.20 --cost-penalty 0.10 --save-weights "%OUT_FILE%"
   )
   goto END
 )
@@ -39,9 +39,9 @@ if /I "%MODE%"=="live" (
 if /I "%MODE%"=="etf" (
   echo [INFO] Running CN ETF rotation mode...
   if exist "%PREV_FILE%" (
-    %PYTHON_BIN% %SCRIPT% --cn-etf-rotation --providers eastmoney,tencent,yahoo,stooq --benchmark 510300.SS --topn 20 --max-weight 0.20 --risk-aversion 0.20 --cost-penalty 0.12 --auto-tune-horizon-weights --prev-weights "%PREV_FILE%" --save-weights "%OUT_FILE%"
+    %PYTHON_BIN% %SCRIPT% --db-only --cn-etf-rotation --providers eastmoney,tencent,yahoo,stooq --benchmark 510300.SS --topn 20 --max-weight 0.20 --risk-aversion 0.20 --cost-penalty 0.12 --auto-tune-horizon-weights --prev-weights "%PREV_FILE%" --save-weights "%OUT_FILE%"
   ) else (
-    %PYTHON_BIN% %SCRIPT% --cn-etf-rotation --providers eastmoney,tencent,yahoo,stooq --benchmark 510300.SS --topn 20 --max-weight 0.20 --risk-aversion 0.20 --cost-penalty 0.12 --auto-tune-horizon-weights --save-weights "%OUT_FILE%"
+    %PYTHON_BIN% %SCRIPT% --db-only --cn-etf-rotation --providers eastmoney,tencent,yahoo,stooq --benchmark 510300.SS --topn 20 --max-weight 0.20 --risk-aversion 0.20 --cost-penalty 0.12 --auto-tune-horizon-weights --save-weights "%OUT_FILE%"
   )
   goto END
 )

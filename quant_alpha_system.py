@@ -519,9 +519,11 @@ def fetch_live_data(
 ) -> Dict[str, List[Row]]:
     data: Dict[str, List[Row]] = defaultdict(list)
     errors: List[str] = []
+    stale_cutoff = end - dt.timedelta(days=7)
 
     for t in tickers:
-        ok = False
+        best_rows: List[Row] = []
+        best_last_date = dt.date(1900, 1, 1)
         for provider in providers:
             try:
                 if provider == "yahoo":
@@ -536,13 +538,19 @@ def fetch_live_data(
                     raise RuntimeError(f"unknown provider: {provider}")
 
                 if len(rows) >= 120:
-                    data[t] = rows
-                    ok = True
-                    break
+                    last_date = rows[-1].date
+                    if (last_date > best_last_date) or (last_date == best_last_date and len(rows) > len(best_rows)):
+                        best_rows = rows
+                        best_last_date = last_date
             except RuntimeError as exc:
                 errors.append(f"{provider}:{t}: {exc}")
 
-        if not ok:
+        if best_rows:
+            if best_last_date < stale_cutoff:
+                errors.append(f"stale data for {t}: latest={best_last_date.isoformat()} cutoff={stale_cutoff.isoformat()}")
+            else:
+                data[t] = best_rows
+        else:
             errors.append(f"all providers failed for {t}")
 
     if not data:
@@ -1236,7 +1244,9 @@ def main():
     parser.add_argument("--save-weights", type=str, default="", help="Output CSV path to save new suggested weights")
     parser.add_argument("--report-csv", type=str, default="", help="Export one-year backtest daily win-rate report CSV")
     parser.add_argument("--db-path", type=str, default="alpha_realtime.db", help="SQLite path for realtime/history cache")
-    parser.add_argument("--db-only", action="store_true", help="Run using local realtime database only (no network fetch)")
+    parser.set_defaults(db_only=True)
+    parser.add_argument("--db-only", dest="db_only", action="store_true", help="Run using local realtime database only (default)")
+    parser.add_argument("--no-db-only", dest="db_only", action="store_false", help="Allow network fetch/refresh (override default db-only)")
     parser.add_argument("--demo", action="store_true", help="Force synthetic demo data")
     parser.add_argument("--no-realtime", action="store_true", help="Disable realtime quote refresh")
     args = parser.parse_args()
@@ -1408,6 +1418,7 @@ def main():
     print(f"Run Time (UTC) : {run_ts}")
     print(f"Data Source    : {source}")
     print(f"Realtime DB    : {args.db_path}")
+    print(f"DB Only Mode   : {'ON' if args.db_only else 'OFF'}")
     if args.cn_etf_rotation:
         print(f"Universe Mode  : CN ETF Rotation ({len(tickers)} symbols)")
     print(f"Benchmark      : {args.benchmark}")

@@ -1,11 +1,13 @@
 import argparse
 import csv
 import datetime as dt
+import http.client
 import json
 import math
 import os
 import random
 import sqlite3
+import ssl
 import time
 from collections import defaultdict
 from dataclasses import dataclass
@@ -119,13 +121,31 @@ def parse_csv(path: str) -> Dict[str, List[Row]]:
     return by_ticker
 
 
-def fetch_json(url: str, timeout: int = 20) -> dict:
+def fetch_json(url: str, timeout: int = 20, retries: int = 3) -> dict:
     req = Request(url, headers={"User-Agent": "Mozilla/5.0"})
-    try:
-        with urlopen(req, timeout=timeout) as resp:
-            return json.loads(resp.read().decode("utf-8"))
-    except (HTTPError, URLError, TimeoutError) as exc:
-        raise RuntimeError(f"Request failed: {exc}") from exc
+    last_exc: Exception | None = None
+
+    for i in range(retries):
+        try:
+            with urlopen(req, timeout=timeout) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except (
+            HTTPError,
+            URLError,
+            TimeoutError,
+            http.client.RemoteDisconnected,
+            ConnectionResetError,
+            ssl.SSLError,
+            json.JSONDecodeError,
+        ) as exc:
+            last_exc = exc
+            # 轻量重试，避免偶发连接中断直接退出
+            if i < retries - 1:
+                time.sleep(0.6 * (i + 1))
+                continue
+            break
+
+    raise RuntimeError(f"Request failed after {retries} retries: {last_exc}") from last_exc
 
 
 def fetch_yahoo_history(ticker: str, start: dt.date, end: dt.date) -> List[Row]:
@@ -1124,4 +1144,10 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as exc:
+        print("[ERROR] Strategy run failed.")
+        print(f"[ERROR] {exc}")
+        print("[HINT] Try: --providers tencent,yahoo,stooq  or  --db-only  or  --demo")
+        raise SystemExit(1)

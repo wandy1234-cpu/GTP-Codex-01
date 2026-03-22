@@ -35,6 +35,7 @@ python quant_alpha_system.py
 - `--no-db-only`（允许联网拉取/刷新数据，**默认开启**）
 - `--cn-etf-rotation`（启用大陆 ETF 轮动模式：自动拉取沪深 ETF 池）
 - `--cn-etf-limit 800`（大陆 ETF 池拉取上限）
+- `--etf-live-limit 120`（ETF 在线模式自动截断股票池，避免超时）
 - `--horizons 5,10,20`（多标签周期）
 - `--horizon-weights 0.2,0.3,0.5`（多标签融合权重）
 - `--auto-tune-horizon-weights`（根据 holdout 回测胜率自动反推多周期融合权重）
@@ -91,6 +92,10 @@ python quant_alpha_system.py --horizons 5,10,20 --auto-tune-horizon-weights
 python quant_alpha_system.py \
   --cn-etf-rotation \
   --providers eastmoney,tencent,yahoo,stooq \
+  --cn-etf-limit 200 \
+  --etf-live-limit 120 \
+  --request-timeout 8 \
+  --request-retries 1 \
   --benchmark 510300.SS \
   --topn 20 \
   --auto-tune-horizon-weights
@@ -98,6 +103,7 @@ python quant_alpha_system.py \
 
 说明：
 - 自动从 Eastmoney 拉取沪深 ETF 列表（失败时回退到内置 ETF 池）；
+- 在线模式会自动截断 ETF 池（默认最多 120）以控制运行时延，避免 Web 端超时；
 - 默认 benchmark 若仍为 `000300.SS`，会自动切到 `510300.SS`；
 - 输出逻辑不变：TopN + 建议组合权重 + 风险/成本惩罚。
 

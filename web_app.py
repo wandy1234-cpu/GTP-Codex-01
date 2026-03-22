@@ -72,6 +72,17 @@ PAGE = """<!doctype html>
 
     <div class="row">
       <div>
+        <label>ETF在线池上限</label>
+        <input id="etf_live_limit" value="120" />
+      </div>
+      <div>
+        <label>ETF抓取上限</label>
+        <input id="cn_etf_limit" value="200" />
+      </div>
+    </div>
+
+    <div class="row">
+      <div>
         <label>Max Weight</label>
         <input id="max_weight" value="0.20" />
       </div>
@@ -121,6 +132,8 @@ async function run() {
     db_only: document.getElementById('db_only').value,
     request_timeout: document.getElementById('request_timeout').value,
     request_retries: document.getElementById('request_retries').value,
+    etf_live_limit: document.getElementById('etf_live_limit').value,
+    cn_etf_limit: document.getElementById('cn_etf_limit').value,
   };
 
   document.getElementById('out').textContent = '运行中...';
@@ -180,6 +193,8 @@ class Handler(BaseHTTPRequestHandler):
         db_only = str(payload.get("db_only", "0"))
         request_timeout = str(payload.get("request_timeout", "8"))
         request_retries = str(payload.get("request_retries", "1"))
+        etf_live_limit = str(payload.get("etf_live_limit", "120"))
+        cn_etf_limit = str(payload.get("cn_etf_limit", "200"))
         csv_path = str(payload.get("csv", "")).strip()
 
         cmd = [
@@ -212,7 +227,18 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 cmd.append("--no-db-only")
         elif mode == "etf":
-            cmd.extend(["--providers", providers, "--cn-etf-rotation", "--auto-tune-horizon-weights"])
+            cmd.extend(
+                [
+                    "--providers",
+                    providers,
+                    "--cn-etf-rotation",
+                    "--auto-tune-horizon-weights",
+                    "--cn-etf-limit",
+                    cn_etf_limit,
+                    "--etf-live-limit",
+                    etf_live_limit,
+                ]
+            )
             if db_only == "1":
                 cmd.append("--db-only")
             else:

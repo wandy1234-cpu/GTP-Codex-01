@@ -1233,6 +1233,12 @@ def main():
     )
     parser.add_argument("--cn-etf-rotation", action="store_true", help="Use mainland ETF universe for rotation recommendation")
     parser.add_argument("--cn-etf-limit", type=int, default=800, help="Max ETF symbols to load from Eastmoney universe API")
+    parser.add_argument(
+        "--etf-live-limit",
+        type=int,
+        default=120,
+        help="When running online ETF mode, cap tradable ETF symbols to avoid timeout.",
+    )
     parser.add_argument("--providers", type=str, default="eastmoney,tencent,yahoo,stooq", help="Data providers in priority order")
     parser.add_argument("--start", type=str, default="2021-01-01")
     parser.add_argument("--end", type=str, default=dt.date.today().isoformat())
@@ -1297,6 +1303,12 @@ def main():
             if args.benchmark == "000300.SS":
                 args.benchmark = "510300.SS"
             tickers = ensure_ticker_pool_size(etf_pool, max(args.topn, 20), args.benchmark)
+            if (not args.db_only) and args.etf_live_limit > 0 and len(tickers) > args.etf_live_limit:
+                print(
+                    f"[WARN] ETF live universe too large ({len(tickers)}), "
+                    f"auto-cap to first {args.etf_live_limit} symbols for latency control."
+                )
+                tickers = tickers[: args.etf_live_limit]
         else:
             tickers = ensure_ticker_pool_size(parse_tickers(args.tickers), args.topn, args.benchmark)
         providers = parse_providers(args.providers)

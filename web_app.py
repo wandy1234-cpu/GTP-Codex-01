@@ -24,7 +24,7 @@ PAGE = """<!doctype html>
   </style>
 </head>
 <body>
-  <h1>A/H Alpha Web 控制台（v8）</h1>
+  <h1>A/H Alpha Web 控制台（Pro v9）</h1>
   <div class="card">
     <div class="row">
       <div>
@@ -69,6 +69,20 @@ PAGE = """<!doctype html>
     <label>Cost Penalty</label>
     <input id="cost_penalty" value="0.10" />
 
+    <div class="row">
+      <div>
+        <label>DB Path</label>
+        <input id="db_path" value="alpha_realtime.db" />
+      </div>
+      <div>
+        <label>DB Only</label>
+        <select id="db_only">
+          <option value="0">否</option>
+          <option value="1">是（仅本地实时库）</option>
+        </select>
+      </div>
+    </div>
+
     <button onclick="run()">运行策略</button>
   </div>
 
@@ -88,6 +102,8 @@ async function run() {
     max_weight: document.getElementById('max_weight').value,
     risk_aversion: document.getElementById('risk_aversion').value,
     cost_penalty: document.getElementById('cost_penalty').value,
+    db_path: document.getElementById('db_path').value,
+    db_only: document.getElementById('db_only').value,
   };
 
   document.getElementById('out').textContent = '运行中...';
@@ -143,6 +159,8 @@ class Handler(BaseHTTPRequestHandler):
         max_weight = str(payload.get("max_weight", "0.20"))
         risk_aversion = str(payload.get("risk_aversion", "0.20"))
         cost_penalty = str(payload.get("cost_penalty", "0.10"))
+        db_path = str(payload.get("db_path", "alpha_realtime.db"))
+        db_only = str(payload.get("db_only", "0"))
         csv_path = str(payload.get("csv", "")).strip()
 
         cmd = [
@@ -158,12 +176,16 @@ class Handler(BaseHTTPRequestHandler):
             risk_aversion,
             "--cost-penalty",
             cost_penalty,
+            "--db-path",
+            db_path,
         ]
 
         if mode == "demo":
             cmd.append("--demo")
         elif mode == "live":
             cmd.extend(["--providers", providers])
+            if db_only == "1":
+                cmd.append("--db-only")
         elif mode == "csv":
             if not csv_path:
                 self._send_json({"error": "csv 模式必须填写 csv 路径"}, 400)

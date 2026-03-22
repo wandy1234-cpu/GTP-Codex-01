@@ -3,7 +3,9 @@ import csv
 import datetime as dt
 import json
 import math
+import os
 import random
+import sqlite3
 import time
 from collections import defaultdict
 from dataclasses import dataclass
@@ -420,6 +422,113 @@ def fetch_live_data(
     return data
 
 
+def init_db(db_path: str) -> None:
+    conn = sqlite3.connect(db_path)
+    cur = conn.cursor()
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS price_history (
+            ticker TEXT NOT NULL,
+            date TEXT NOT NULL,
+            close REAL NOT NULL,
+            high REAL NOT NULL,
+            low REAL NOT NULL,
+            volume REAL NOT NULL,
+            PRIMARY KEY (ticker, date)
+        )
+        """
+    )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS realtime_quotes (
+            ticker TEXT PRIMARY KEY,
+            price REAL NOT NULL,
+            ts_utc TEXT NOT NULL
+        )
+        """
+    )
+    conn.commit()
+    conn.close()
+
+
+def save_history_to_db(db_path: str, data: Dict[str, List[Row]]) -> None:
+    init_db(db_path)
+    conn = sqlite3.connect(db_path)
+    cur = conn.cursor()
+    for ticker, rows in data.items():
+        for r in rows:
+            cur.execute(
+                """
+                INSERT OR REPLACE INTO price_history (ticker, date, close, high, low, volume)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (ticker, r.date.isoformat(), r.close, r.high, r.low, r.volume),
+            )
+    conn.commit()
+    conn.close()
+
+
+def save_quotes_to_db(db_path: str, quotes: Dict[str, Tuple[float, dt.datetime]]) -> None:
+    if not quotes:
+        return
+    init_db(db_path)
+    conn = sqlite3.connect(db_path)
+    cur = conn.cursor()
+    for ticker, (price, ts) in quotes.items():
+        cur.execute(
+            "INSERT OR REPLACE INTO realtime_quotes (ticker, price, ts_utc) VALUES (?, ?, ?)",
+            (ticker, price, ts.isoformat()),
+        )
+    conn.commit()
+    conn.close()
+
+
+def load_history_from_db(db_path: str, tickers: List[str], start: dt.date, end: dt.date) -> Dict[str, List[Row]]:
+    if not os.path.exists(db_path):
+        return {}
+    conn = sqlite3.connect(db_path)
+    cur = conn.cursor()
+    data: Dict[str, List[Row]] = defaultdict(list)
+    for tk in tickers:
+        cur.execute(
+            """
+            SELECT date, close, high, low, volume
+            FROM price_history
+            WHERE ticker = ? AND date >= ? AND date <= ?
+            ORDER BY date
+            """,
+            (tk, start.isoformat(), end.isoformat()),
+        )
+        for d, c, h, l, v in cur.fetchall():
+            data[tk].append(
+                Row(
+                    date=dt.datetime.strptime(d, "%Y-%m-%d").date(),
+                    ticker=tk,
+                    close=float(c),
+                    high=float(h),
+                    low=float(l),
+                    volume=float(v),
+                )
+            )
+    conn.close()
+    return data
+
+
+def load_latest_quotes_from_db(db_path: str, tickers: List[str]) -> Dict[str, Tuple[float, dt.datetime]]:
+    if not os.path.exists(db_path):
+        return {}
+    conn = sqlite3.connect(db_path)
+    cur = conn.cursor()
+    out: Dict[str, Tuple[float, dt.datetime]] = {}
+    for tk in tickers:
+        cur.execute("SELECT price, ts_utc FROM realtime_quotes WHERE ticker = ?", (tk,))
+        row = cur.fetchone()
+        if row:
+            out[tk] = (float(row[0]), dt.datetime.fromisoformat(row[1]))
+    conn.close()
+    return out
+
+
 def generate_demo_data(seed: int = 42) -> Dict[str, List[Row]]:
     random.seed(seed)
     tickers = ["000300.SS", "600519.SS", "000858.SZ", "601318.SS", "0700.HK", "9988.HK", "0939.HK"]
@@ -747,7 +856,7 @@ def parse_providers(providers_str: str) -> List[str]:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="A/H Alpha Demo v8 (CN-sources first + excess label + risk/cost-aware portfolio)")
+    parser = argparse.ArgumentParser(description="A/H Alpha Pro v9 (realtime DB + professional report)")
     parser.add_argument("--input-csv", type=str, default="", help="CSV path with columns: date,ticker,close,high,low,volume")
     parser.add_argument(
         "--tickers",
@@ -766,6 +875,8 @@ def main():
     parser.add_argument("--cost-penalty", type=float, default=0.10, help="Penalty coefficient for turnover proxy in scoring")
     parser.add_argument("--prev-weights", type=str, default="", help="Previous portfolio weights CSV path (ticker,weight)")
     parser.add_argument("--save-weights", type=str, default="", help="Output CSV path to save new suggested weights")
+    parser.add_argument("--db-path", type=str, default="alpha_realtime.db", help="SQLite path for realtime/history cache")
+    parser.add_argument("--db-only", action="store_true", help="Run using local realtime database only (no network fetch)")
     parser.add_argument("--demo", action="store_true", help="Force synthetic demo data")
     parser.add_argument("--no-realtime", action="store_true", help="Disable realtime quote refresh")
     args = parser.parse_args()
@@ -775,27 +886,41 @@ def main():
     if args.input_csv:
         data = parse_csv(args.input_csv)
         source = f"CSV: {args.input_csv}"
+        save_history_to_db(args.db_path, data)
     elif args.demo:
         data = generate_demo_data(seed=42)
         source = "synthetic demo data"
+        save_history_to_db(args.db_path, data)
     else:
         start = dt.datetime.strptime(args.start, "%Y-%m-%d").date()
         end = dt.datetime.strptime(args.end, "%Y-%m-%d").date()
         tickers = parse_tickers(args.tickers)
         providers = parse_providers(args.providers)
-        data = fetch_live_data(tickers, start, end, providers)
-        source = f"latest daily via {providers} [{start}..{end}]"
-
-        if not args.no_realtime:
+        if args.db_only:
+            data = load_history_from_db(args.db_path, tickers, start, end)
+            latest_quote = load_latest_quotes_from_db(args.db_path, tickers)
+            source = f"local realtime db [{args.db_path}] [{start}..{end}]"
+        else:
             try:
-                # 优先大陆源实时，再回退 Yahoo
-                latest_quote = fetch_latest_quote_eastmoney(list(data.keys()))
-                if not latest_quote:
-                    latest_quote = fetch_latest_quote_tencent(list(data.keys()))
-                if not latest_quote:
-                    latest_quote = fetch_latest_quote_yahoo(list(data.keys()))
+                data = fetch_live_data(tickers, start, end, providers)
+                source = f"latest daily via {providers} [{start}..{end}]"
+                save_history_to_db(args.db_path, data)
             except RuntimeError as exc:
-                print(f"[WARN] realtime quote refresh failed: {exc}")
+                print(f"[WARN] live fetch failed, fallback to db: {exc}")
+                data = load_history_from_db(args.db_path, tickers, start, end)
+                source = f"fallback local db [{args.db_path}] [{start}..{end}]"
+
+            if not args.no_realtime:
+                try:
+                    latest_quote = fetch_latest_quote_eastmoney(list(data.keys()))
+                    if not latest_quote:
+                        latest_quote = fetch_latest_quote_tencent(list(data.keys()))
+                    if not latest_quote:
+                        latest_quote = fetch_latest_quote_yahoo(list(data.keys()))
+                    save_quotes_to_db(args.db_path, latest_quote)
+                except RuntimeError as exc:
+                    print(f"[WARN] realtime quote refresh failed, use db quote: {exc}")
+                    latest_quote = load_latest_quotes_from_db(args.db_path, list(data.keys()))
 
     samples = build_samples(data, horizon=args.horizon, benchmark_ticker=args.benchmark)
     if len(samples) < 500:
@@ -822,23 +947,31 @@ def main():
     turnover = estimate_turnover(prev_w, new_w) if prev_w else 0.0
     save_weights(args.save_weights, portfolio)
 
-    print("=== A/H Alpha Demo v8 ===")
-    print(f"Data source : {source}")
-    print(f"Benchmark   : {args.benchmark}")
-    print("Label mode  : excess return > 0 (fallback: absolute return > 0)")
-    print(f"Feature set : {', '.join(FEATURE_NAMES)}")
-    print(f"Train/Test  : {len(train):,}/{len(test):,}")
-    print(f"Threshold   : {t:.2f}")
-    print(f"Accuracy    : {m.accuracy:.4f}")
-    print(f"Precision   : {m.precision:.4f}")
-    print(f"Recall      : {m.recall:.4f}")
-    print(f"ROC-AUC     : {m.auc:.4f}")
-
-    print(f"\n=== Top {args.topn} @ model_date={latest_date.isoformat()} ===")
+    run_ts = dt.datetime.utcnow().isoformat() + "Z"
+    print("==============================================")
+    print(" A/H ALPHA TERMINAL PRO v9")
+    print(" Index Enhancement | Excess Return Engine")
+    print("==============================================")
+    print(f"Run Time (UTC) : {run_ts}")
+    print(f"Data Source    : {source}")
+    print(f"Realtime DB    : {args.db_path}")
+    print(f"Benchmark      : {args.benchmark}")
+    print("Label Mode     : excess return > 0 (fallback: absolute return > 0)")
+    print(f"Feature Set    : {', '.join(FEATURE_NAMES)}")
+    print("----------------------------------------------")
+    print(f"Train/Test     : {len(train):,}/{len(test):,}")
+    print(f"Threshold      : {t:.2f}")
+    print(f"Accuracy       : {m.accuracy:.4f}")
+    print(f"Precision      : {m.precision:.4f}")
+    print(f"Recall         : {m.recall:.4f}")
+    print(f"ROC-AUC        : {m.auc:.4f}")
+    print("----------------------------------------------")
+    print(f"TOP {args.topn} CANDIDATES @ model_date={latest_date.isoformat()}")
     for tk, px, p, risk20, src in top:
         print(f"{tk:10s} px={px:10.3f} up_prob={p:.4f} risk20={risk20:.4f} [{src}]")
 
-    print("\n=== Suggested Portfolio Weights (alpha+risk+cost) ===")
+    print("----------------------------------------------")
+    print("SUGGESTED PORTFOLIO (alpha+risk+cost)")
     for tk, wt, p, risk20, src in portfolio:
         print(f"{tk:10s} weight={wt:6.2%} up_prob={p:.4f} risk20={risk20:.4f} [{src}]")
     if args.prev_weights:

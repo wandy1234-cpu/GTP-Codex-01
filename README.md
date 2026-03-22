@@ -36,6 +36,7 @@ python quant_alpha_system.py
 - `--horizon-weights 0.2,0.3,0.5`（多标签融合权重）
 - `--report-csv one_year_report.csv`（导出近1年每日胜率报告）
 - 会尝试实时 quote 刷新；失败则回退到最新日线
+- 为避免 `--db-only` 与联网模式因“陈旧实时价”产生偏差，程序仅使用不早于 `--end` 当天 00:00(UTC) 的 quote，过旧 quote 自动忽略并回退日线收盘价
 
 ## 2) 指定数据窗口与股票池
 

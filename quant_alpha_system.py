@@ -623,6 +623,42 @@ def load_latest_quotes_from_db(db_path: str, tickers: List[str]) -> Dict[str, Tu
     return out
 
 
+def merge_with_db_history(
+    live_data: Dict[str, List[Row]],
+    db_data: Dict[str, List[Row]],
+) -> Dict[str, List[Row]]:
+    """
+    Merge live and DB history by ticker/date.
+    Priority: live row > db row when date overlaps.
+    """
+    out: Dict[str, List[Row]] = {}
+    tickers = set(live_data.keys()) | set(db_data.keys())
+    for tk in tickers:
+        merged: Dict[dt.date, Row] = {}
+        for r in db_data.get(tk, []):
+            merged[r.date] = r
+        for r in live_data.get(tk, []):
+            merged[r.date] = r
+        if merged:
+            out[tk] = [merged[d] for d in sorted(merged.keys())]
+    return out
+
+
+def filter_fresh_quotes(
+    quotes: Dict[str, Tuple[float, dt.datetime]],
+    min_ts_utc: dt.datetime,
+) -> Dict[str, Tuple[float, dt.datetime]]:
+    """
+    Keep only quotes newer than min_ts_utc.
+    This avoids mixing stale db-only quotes with fresh live-mode quotes.
+    """
+    out: Dict[str, Tuple[float, dt.datetime]] = {}
+    for tk, (px, ts) in quotes.items():
+        if ts >= min_ts_utc:
+            out[tk] = (px, ts)
+    return out
+
+
 def save_names_to_db(db_path: str, names: Dict[str, str]) -> None:
     if not names:
         return
@@ -1137,12 +1173,16 @@ def main():
         if args.db_only:
             data = load_history_from_db(args.db_path, tickers, start, end)
             latest_quote = load_latest_quotes_from_db(args.db_path, tickers)
+            fresh_cutoff = dt.datetime.combine(end, dt.time.min)
+            latest_quote = filter_fresh_quotes(latest_quote, fresh_cutoff)
             runtime_names = load_names_from_db(args.db_path, tickers)
             source = f"local realtime db [{args.db_path}] [{start}..{end}]"
         else:
             try:
-                data = fetch_live_data(tickers, start, end, providers)
+                live_data = fetch_live_data(tickers, start, end, providers)
                 source = f"latest daily via {providers} [{start}..{end}]"
+                db_data = load_history_from_db(args.db_path, tickers, start, end)
+                data = merge_with_db_history(live_data, db_data)
                 save_history_to_db(args.db_path, data)
             except RuntimeError as exc:
                 print(f"[WARN] live fetch failed, fallback to db: {exc}")
@@ -1160,6 +1200,8 @@ def main():
                 except RuntimeError as exc:
                     print(f"[WARN] realtime quote refresh failed, use db quote: {exc}")
                     latest_quote = load_latest_quotes_from_db(args.db_path, list(data.keys()))
+            fresh_cutoff = dt.datetime.combine(end, dt.time.min)
+            latest_quote = filter_fresh_quotes(latest_quote, fresh_cutoff)
 
             # 优先获取股票中文名并入库
             runtime_names = fetch_stock_names_eastmoney(list(data.keys()))

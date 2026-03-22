@@ -9,6 +9,7 @@ import random
 import sqlite3
 import ssl
 import time
+from bisect import bisect_right
 from collections import defaultdict
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -56,6 +57,7 @@ FEATURE_NAMES = [
     "vol_ratio",
     "ma_gap_10_30",
     "price_pos_20d",
+    "ib_top5_score",
 ]
 
 DEFAULT_TICKERS = [
@@ -130,6 +132,38 @@ def parse_csv(path: str) -> Dict[str, List[Row]]:
     for t in by_ticker:
         by_ticker[t].sort(key=lambda x: x.date)
     return by_ticker
+
+
+def load_institutional_factor_csv(path: str) -> Dict[str, List[Tuple[dt.date, float]]]:
+    out: Dict[str, List[Tuple[dt.date, float]]] = defaultdict(list)
+    with open(path, "r", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        required = {"date", "ticker", "score"}
+        if not reader.fieldnames or not required.issubset(set(reader.fieldnames)):
+            missing = required - set(reader.fieldnames or [])
+            raise ValueError(f"Institution factor CSV missing required columns: {sorted(missing)}")
+        for r in reader:
+            d = dt.datetime.strptime(str(r["date"]), "%Y-%m-%d").date()
+            tk = str(r["ticker"]).strip()
+            sc = float(r["score"])
+            if tk:
+                out[tk].append((d, sc))
+    for tk in out:
+        out[tk].sort(key=lambda x: x[0])
+    return out
+
+
+def get_institutional_score(
+    factor_map: Dict[str, List[Tuple[dt.date, float]]], ticker: str, asof: dt.date
+) -> float:
+    seq = factor_map.get(ticker)
+    if not seq:
+        return 0.0
+    dates = [x[0] for x in seq]
+    idx = bisect_right(dates, asof) - 1
+    if idx < 0:
+        return 0.0
+    return float(seq[idx][1])
 
 
 def fetch_json(url: str, timeout: Optional[int] = None, retries: Optional[int] = None) -> dict:
@@ -845,7 +879,12 @@ def build_benchmark_close_map(data: Dict[str, List[Row]], benchmark_ticker: str)
     return {r.date: r.close for r in rows}
 
 
-def build_samples(data: Dict[str, List[Row]], horizon: int, benchmark_ticker: str) -> List[Sample]:
+def build_samples(
+    data: Dict[str, List[Row]],
+    horizon: int,
+    benchmark_ticker: str,
+    institutional_factor: Optional[Dict[str, List[Tuple[dt.date, float]]]] = None,
+) -> List[Sample]:
     samples: List[Sample] = []
     eps = 1e-9
     bm_5d_ret = build_benchmark_ret_map(data, benchmark_ticker)
@@ -874,6 +913,11 @@ def build_samples(data: Dict[str, List[Row]], horizon: int, benchmark_ticker: st
             low20 = min(lows[i - 19 : i + 1])
             high20 = max(highs[i - 19 : i + 1])
             pos20 = (closes[i] - low20) / (high20 - low20 + eps)
+            ib_score = (
+                get_institutional_score(institutional_factor, ticker, rows[i].date)
+                if institutional_factor
+                else 0.0
+            )
             future_ret = closes[i + horizon] / closes[i] - 1.0
             # v6: 以“同起止日期的超额收益”作为标签，更贴近指数增强目标
             d0 = rows[i].date
@@ -888,7 +932,7 @@ def build_samples(data: Dict[str, List[Row]], horizon: int, benchmark_ticker: st
                 Sample(
                     date=rows[i].date,
                     ticker=ticker,
-                    features=[ret_1d, ret_5d, ret_20d, rel_ret_5d, vol_20d, vol_ratio, ma_gap, pos20],
+                    features=[ret_1d, ret_5d, ret_20d, rel_ret_5d, vol_20d, vol_ratio, ma_gap, pos20, ib_score],
                     target=target,
                     close=closes[i],
                 )
@@ -1307,6 +1351,12 @@ def main():
     parser = argparse.ArgumentParser(description="A/H Alpha Pro v10 (multi-horizon ensemble for index enhancement)")
     parser.add_argument("--input-csv", type=str, default="", help="CSV path with columns: date,ticker,close,high,low,volume")
     parser.add_argument(
+        "--institution-factor-csv",
+        type=str,
+        default="",
+        help="Optional CSV with columns date,ticker,score for top-5 foreign IB holdings factor",
+    )
+    parser.add_argument(
         "--tickers",
         type=str,
         default=",".join(DEFAULT_TICKERS),
@@ -1380,6 +1430,10 @@ def main():
 
     latest_quote: Dict[str, Tuple[float, dt.datetime]] = {}
     runtime_names: Dict[str, str] = {}
+    institutional_factor: Dict[str, List[Tuple[dt.date, float]]] = {}
+
+    if args.institution_factor_csv:
+        institutional_factor = load_institutional_factor_csv(args.institution_factor_csv)
 
     if args.input_csv:
         data = parse_csv(args.input_csv)
@@ -1488,7 +1542,9 @@ def main():
         min_samples_required = 180
 
     for h in horizons:
-        samples_h = build_samples(data, horizon=h, benchmark_ticker=args.benchmark)
+        samples_h = build_samples(
+            data, horizon=h, benchmark_ticker=args.benchmark, institutional_factor=institutional_factor
+        )
         if len(samples_h) < min_samples_required:
             continue
         train, test = train_test_split(samples_h, split_ratio=0.8)
@@ -1525,7 +1581,9 @@ def main():
     if not per_horizon_maps and args.cn_etf_rotation:
         print("[WARN] ETF mode: multi-horizon samples insufficient, fallback to single horizon=5 with relaxed threshold.")
         h = 5
-        samples_h = build_samples(data, horizon=h, benchmark_ticker=args.benchmark)
+        samples_h = build_samples(
+            data, horizon=h, benchmark_ticker=args.benchmark, institutional_factor=institutional_factor
+        )
         if len(samples_h) >= 120:
             train, test = train_test_split(samples_h, split_ratio=0.8)
             if train and test:
@@ -1615,6 +1673,7 @@ def main():
     print("==============================================")
     print(f"Run Time (UTC) : {run_ts}")
     print(f"Data Source    : {source}")
+    print(f"IB Factor CSV  : {args.institution_factor_csv if args.institution_factor_csv else 'OFF'}")
     if aligned_to:
         print(f"Data Align     : common_date={aligned_to.isoformat()} (coverage>={min(max(args.common_date_coverage, 0.5), 1.0):.0%})")
     if using_stable_db_snapshot:

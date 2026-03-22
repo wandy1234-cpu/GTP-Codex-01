@@ -41,6 +41,7 @@ python quant_alpha_system.py
 - `--auto-tune-horizon-weights`（根据 holdout 回测胜率自动反推多周期融合权重）
 - `--min-samples 500`（每个 horizon 最低样本门槛；ETF 模式默认自动放宽到 180）
 - `--report-csv one_year_report.csv`（导出近1年每日胜率报告）
+- `--institution-factor-csv ib_top5_factor.csv`（可选：外资投行 Top5 持仓因子，列为 `date,ticker,score`）
 - 会尝试实时 quote 刷新；失败则回退到最新日线
 - 为避免 `--db-only` 与联网模式因“陈旧实时价”产生偏差，程序仅使用不早于 `--end` 当天 00:00(UTC) 的 quote，过旧 quote 自动忽略并回退日线收盘价
 - 联网模式会在多数据源中优先选“最新日期”的日线数据，并过滤掉明显过旧（默认落后超过 7 天）的数据源结果
@@ -115,6 +116,24 @@ CSV 列：`date,ticker,close,high,low,volume`
 
 ```bash
 python quant_alpha_system.py --input-csv your_ah_data.csv --horizon 5 --topn 10
+```
+
+### 4.1) 接入外资投行 Top5 持仓因子（新增）
+
+如果你有“Top5 外资投行在 A/H 的聚合持仓数据”，可直接以额外因子接入模型。
+
+CSV 格式：
+
+```csv
+date,ticker,score
+2026-03-20,600519.SS,0.82
+2026-03-20,0700.HK,0.76
+```
+
+运行示例：
+
+```bash
+python quant_alpha_system.py --input-csv your_ah_data.csv --institution-factor-csv ib_top5_factor.csv --topn 10
 ```
 
 ## 5) 离线演示模式

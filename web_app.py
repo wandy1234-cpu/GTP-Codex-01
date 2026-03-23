@@ -39,7 +39,6 @@ PAGE = """<!doctype html>
           <option value="live">live（在线）</option>
           <option value="demo">demo（离线）</option>
           <option value="etf">etf（大陆ETF轮动）</option>
-          <option value="csv">csv（本地文件）</option>
         </select>
       </div>
       <div>
@@ -47,9 +46,6 @@ PAGE = """<!doctype html>
         <input id="topn" value="10" />
       </div>
     </div>
-
-    <label>CSV 路径（仅 csv 模式）</label>
-    <input id="csv" value="C:\\Users\\Admin\\Desktop\\GTP-Codex-01" />
 
     <div class="row">
       <div>
@@ -172,9 +168,11 @@ PAGE = """<!doctype html>
   <div class="card">
     <h3>Walk-forward 图表</h3>
     <div id="wf_hint">运行后若开启 walk-forward，将展示日胜率、累计胜率、月度胜率。</div>
-    <button onclick="exportWalkForwardSnapshot()">导出图表截图（PNG）</button>
+    <button id="wf_export_btn" onclick="exportWalkForwardSnapshot()" disabled>一键导出 Walk-forward 图表截图（PNG）</button>
     <canvas id="wf_daily_chart" width="920" height="220"></canvas>
     <canvas id="wf_monthly_chart" width="920" height="220" style="margin-top:10px;"></canvas>
+    <div id="wf_export_status" style="margin-top:8px; color:#2f6f44;"></div>
+    <div id="wf_export_preview"></div>
   </div>
 
   <div class="card">
@@ -187,7 +185,6 @@ async function run() {
   const payload = {
     mode: document.getElementById('mode').value,
     topn: document.getElementById('topn').value,
-    csv: document.getElementById('csv').value,
     use_institution_factor: document.getElementById('use_institution_factor').value,
     use_market_sentiment: document.getElementById('use_market_sentiment').value,
     use_global_macro: document.getElementById('use_global_macro').value,
@@ -209,6 +206,7 @@ async function run() {
   };
 
   document.getElementById('out').textContent = '运行中...';
+  document.getElementById('wf_export_status').textContent = '';
   const res = await fetch('/run', { method: 'POST', body: JSON.stringify(payload) });
   const data = await res.json();
   document.getElementById('out').textContent = data.output || data.error || '无输出';
@@ -315,6 +313,7 @@ function renderWalkForward(report) {
     hint.textContent = '无 walk-forward 结果（可能关闭了该选项或样本不足）。';
     const c1 = dailyCanvas.getContext('2d'); c1.clearRect(0, 0, dailyCanvas.width, dailyCanvas.height);
     const c2 = monthlyCanvas.getContext('2d'); c2.clearRect(0, 0, monthlyCanvas.width, monthlyCanvas.height);
+    document.getElementById('wf_export_btn').disabled = true;
     return;
   }
   hint.textContent = `overall: ${(report.overall_win_rate * 100).toFixed(2)}% | n=${report.selected_count}（当前版本暂不提供“权重漂移”曲线）`;
@@ -335,6 +334,7 @@ function renderWalkForward(report) {
     0,
     1
   );
+  document.getElementById('wf_export_btn').disabled = false;
 }
 
 function exportWalkForwardSnapshot() {
@@ -370,10 +370,14 @@ function exportWalkForwardSnapshot() {
   ctx.fillText('output tail: ' + tail, 24, 562);
   ctx.fillText('generated: ' + new Date().toLocaleString(), 24, 584);
 
+  const pngData = c.toDataURL('image/png');
   const a = document.createElement('a');
-  a.href = c.toDataURL('image/png');
+  a.href = pngData;
   a.download = `wf_snapshot_${stamp}.png`;
   a.click();
+  document.getElementById('wf_export_status').textContent = `已导出：${a.download}`;
+  document.getElementById('wf_export_preview').innerHTML =
+    `<div style="margin-top:8px;"><img src="${pngData}" alt="wf snapshot" style="max-width:460px;border:1px solid #ddd;border-radius:6px;" /></div>`;
 }
 </script>
 </body>
@@ -474,7 +478,6 @@ class Handler(BaseHTTPRequestHandler):
         request_retries = str(payload.get("request_retries", "1"))
         etf_live_limit = str(payload.get("etf_live_limit", "120"))
         cn_etf_limit = str(payload.get("cn_etf_limit", "200"))
-        csv_path = str(payload.get("csv", "")).strip()
         use_institution_factor = str(payload.get("use_institution_factor", "1"))
         use_market_sentiment = str(payload.get("use_market_sentiment", "1"))
         use_global_macro = str(payload.get("use_global_macro", "1"))
@@ -541,11 +544,6 @@ class Handler(BaseHTTPRequestHandler):
                 cmd.append("--db-only")
             else:
                 cmd.append("--no-db-only")
-        elif mode == "csv":
-            if not csv_path:
-                self._send_json({"error": "csv 模式必须填写 csv 路径"}, 400)
-                return
-            cmd.extend(["--input-csv", csv_path])
         else:
             self._send_json({"error": f"未知模式: {html.escape(mode)}"}, 400)
             return

@@ -197,7 +197,7 @@ http://127.0.0.1:8000
 > 现在执行 `python web_app.py` 会自动尝试打开默认浏览器。
 
 页面支持：
-- `demo` / `live` / `csv` 三种模式
+- `demo` / `live` / `etf` 三种模式
 - TopN、benchmark、providers、max-weight、risk-aversion、cost-penalty 参数可视化配置
 - DB Path、DB Only 可视化配置（实时数据库模式）
 - 支持“是否考虑外资投行因子”下拉（默认：是）
@@ -205,11 +205,10 @@ http://127.0.0.1:8000
 - Web 页不再显示“外资因子 CSV 路径”输入框；开启因子时会自动读取项目目录下 `ib_top5_factor.csv`
 - 输出中会显示每个 TopN 标的的主要因子贡献（Top3）
 - `请求超时(秒)` / `重试次数` 可视化配置（解决 live 模式超时问题）
-- CSV 路径默认预填：`C:\Users\Admin\Desktop\GTP-Codex-01`
 - 可视化配置 Walk-forward 参数：`WF 训练天数/测试天数/步长天数`
 - 在线展示 `quant_alpha_system.py` 的完整输出
 - 当开启 Walk-forward 时，Web 端会自动绘制：日胜率、累计胜率、月度胜率图
-- Web 端支持一键导出 Walk-forward 图表截图（PNG）
+- Web 端支持一键导出 Walk-forward 图表截图（PNG），导出后会显示“已导出”提示与缩略预览
 
 ## 6) 这次算法/工程升级点
 

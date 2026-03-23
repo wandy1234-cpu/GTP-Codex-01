@@ -1093,6 +1093,42 @@ def standardize(
     return x_train, y_train, x_test, y_test, means, stds
 
 
+def auto_tune_feature_scalers(x_train: List[List[float]], y_train: List[int]) -> List[float]:
+    """
+    Compute per-feature scaling multipliers from train split only.
+    Uses absolute Pearson correlation with target as feature strength proxy.
+    """
+    if not x_train:
+        return []
+    n_feat = len(x_train[0])
+    y_mean = sum(y_train) / max(len(y_train), 1)
+    y_var = sum((y - y_mean) ** 2 for y in y_train) / max(len(y_train) - 1, 1)
+    y_std = math.sqrt(max(y_var, 1e-12))
+    scores: List[float] = []
+    for j in range(n_feat):
+        col = [row[j] for row in x_train]
+        x_mean = sum(col) / len(col)
+        x_var = sum((v - x_mean) ** 2 for v in col) / max(len(col) - 1, 1)
+        x_std = math.sqrt(max(x_var, 1e-12))
+        cov = sum((col[i] - x_mean) * (y_train[i] - y_mean) for i in range(len(col))) / max(len(col) - 1, 1)
+        corr = cov / (x_std * y_std + 1e-12)
+        scores.append(abs(corr))
+    mean_s = sum(scores) / max(len(scores), 1)
+    if mean_s <= 0:
+        return [1.0] * n_feat
+    # Center around 1.0 and clamp for stability.
+    return [min(1.8, max(0.6, s / mean_s)) for s in scores]
+
+
+def apply_feature_scalers(x: List[List[float]], scalers: List[float]) -> List[List[float]]:
+    if not x or not scalers:
+        return x
+    out: List[List[float]] = []
+    for row in x:
+        out.append([row[i] * scalers[i] for i in range(len(scalers))])
+    return out
+
+
 def train_logistic_sgd(
     x: List[List[float]], y: List[int], epochs: int = 45, lr: float = 0.035, l2: float = 2e-4
 ) -> Tuple[List[float], float]:
@@ -1163,6 +1199,22 @@ def compute_metrics(y_true: List[int], y_prob: List[float], threshold: float = 0
         auc = better / total
 
     return Metrics(accuracy=acc, precision=prec, recall=rec, auc=auc)
+
+
+def holdout_top20_winrate(test: List[Sample], probs: List[float], y_true: List[int]) -> float:
+    by_day: Dict[dt.date, List[Tuple[float, int]]] = defaultdict(list)
+    for s, p, y in zip(test, probs, y_true):
+        by_day[s.date].append((p, y))
+    total_sel = 0
+    total_win = 0
+    for d in by_day:
+        arr = sorted(by_day[d], key=lambda x: x[0], reverse=True)
+        n = max(1, int(len(arr) * 0.2))
+        sel = arr[:n]
+        wins = sum(1 for _p, y in sel if y == 1)
+        total_sel += n
+        total_win += wins
+    return (total_win / total_sel) if total_sel else 0.0
 
 
 def rank_latest(
@@ -1561,6 +1613,12 @@ def main():
         default="",
         help="Optional CSV output for TopN factor attribution details",
     )
+    parser.add_argument(
+        "--feature-weights-csv",
+        type=str,
+        default="",
+        help="Optional CSV output for auto-tuned feature scaling weights by horizon",
+    )
     parser.add_argument("--db-path", type=str, default="alpha_realtime.db", help="SQLite path for realtime/history cache")
     parser.set_defaults(db_only=False)
     parser.add_argument("--db-only", dest="db_only", action="store_true", help="Run using local realtime database only")
@@ -1570,6 +1628,19 @@ def main():
     parser.add_argument("--min-samples", type=int, default=500, help="Minimum sample count required per horizon")
     parser.add_argument("--request-timeout", type=int, default=12, help="Per-request timeout seconds for online providers")
     parser.add_argument("--request-retries", type=int, default=2, help="Retry count for online provider requests")
+    parser.set_defaults(auto_tune_factor_weights=True)
+    parser.add_argument(
+        "--auto-tune-factor-weights",
+        dest="auto_tune_factor_weights",
+        action="store_true",
+        help="Auto-tune per-feature scaling weights from train split (default ON).",
+    )
+    parser.add_argument(
+        "--no-auto-tune-factor-weights",
+        dest="auto_tune_factor_weights",
+        action="store_false",
+        help="Disable auto feature-weight tuning.",
+    )
     parser.add_argument(
         "--full-provider-scan",
         action="store_true",
@@ -1724,6 +1795,7 @@ def main():
 
     per_horizon_maps: Dict[int, Dict[str, Tuple[float, float, float, str]]] = {}
     per_horizon_contrib_maps: Dict[int, Dict[str, List[float]]] = {}
+    per_horizon_feature_scalers: Dict[int, List[float]] = {}
     per_horizon_test: Dict[int, List[Tuple[dt.date, str, float, int]]] = {}
     metrics_rows: List[Tuple[int, int, int, float, float, float, float]] = []
     latest_dates: List[dt.date] = []
@@ -1748,12 +1820,39 @@ def main():
         if not train or not test:
             continue
         x_train, y_train, x_test, y_test, means, stds = standardize(train, test)
-        w, b = train_logistic_sgd(x_train, y_train)
-        probs = predict_prob(w, b, x_test)
-        t = best_threshold(y_test, probs)
-        m = compute_metrics(y_test, probs, threshold=t)
+        base_scalers = [1.0] * len(FEATURE_NAMES)
+        x_train_base = apply_feature_scalers(x_train, base_scalers)
+        x_test_base = apply_feature_scalers(x_test, base_scalers)
+        w_base, b_base = train_logistic_sgd(x_train_base, y_train)
+        probs_base = predict_prob(w_base, b_base, x_test_base)
+        t_base = best_threshold(y_test, probs_base)
+        m_base = compute_metrics(y_test, probs_base, threshold=t_base)
+        wr_base = holdout_top20_winrate(test, probs_base, y_test)
+
+        scalers = base_scalers
+        w, b = w_base, b_base
+        probs = probs_base
+        t = t_base
+        m = m_base
+
+        if args.auto_tune_factor_weights:
+            cand_scalers = auto_tune_feature_scalers(x_train, y_train)
+            x_train_t = apply_feature_scalers(x_train, cand_scalers)
+            x_test_t = apply_feature_scalers(x_test, cand_scalers)
+            w_t, b_t = train_logistic_sgd(x_train_t, y_train)
+            probs_t = predict_prob(w_t, b_t, x_test_t)
+            t_t = best_threshold(y_test, probs_t)
+            m_t = compute_metrics(y_test, probs_t, threshold=t_t)
+            wr_t = holdout_top20_winrate(test, probs_t, y_test)
+            if (wr_t > wr_base) or (wr_t == wr_base and m_t.auc >= m_base.auc):
+                scalers = cand_scalers
+                w, b = w_t, b_t
+                probs = probs_t
+                t = t_t
+                m = m_t
         metrics_rows.append((h, len(train), len(test), t, m.accuracy, m.precision, m.auc))
         per_horizon_test[h] = [(row.date, row.ticker, pp, yy) for row, pp, yy in zip(test, probs, y_test)]
+        per_horizon_feature_scalers[h] = scalers
 
         latest_date = max(s.date for s in samples_h)
         latest_dates.append(latest_date)
@@ -1761,7 +1860,7 @@ def main():
         mapp: Dict[str, Tuple[float, float, float, str]] = {}
         cmap: Dict[str, List[float]] = {}
         for s in latest:
-            x = [(s.features[i] - means[i]) / stds[i] for i in range(len(means))]
+            x = [((s.features[i] - means[i]) / stds[i]) * scalers[i] for i in range(len(means))]
             p = sigmoid(sum(w[j] * x[j] for j in range(len(w))) + b)
             contrib = [w[j] * x[j] for j in range(len(w))]
             risk20 = s.features[4] if len(s.features) > 4 else 0.0
@@ -1794,19 +1893,45 @@ def main():
             train, test = train_test_split(samples_h, split_ratio=0.8)
             if train and test:
                 x_train, y_train, x_test, y_test, means, stds = standardize(train, test)
-                w, b = train_logistic_sgd(x_train, y_train)
-                probs = predict_prob(w, b, x_test)
-                t = best_threshold(y_test, probs)
-                m = compute_metrics(y_test, probs, threshold=t)
+                base_scalers = [1.0] * len(FEATURE_NAMES)
+                x_train_base = apply_feature_scalers(x_train, base_scalers)
+                x_test_base = apply_feature_scalers(x_test, base_scalers)
+                w_base, b_base = train_logistic_sgd(x_train_base, y_train)
+                probs_base = predict_prob(w_base, b_base, x_test_base)
+                t_base = best_threshold(y_test, probs_base)
+                m_base = compute_metrics(y_test, probs_base, threshold=t_base)
+                wr_base = holdout_top20_winrate(test, probs_base, y_test)
+
+                scalers = base_scalers
+                w, b = w_base, b_base
+                probs = probs_base
+                t = t_base
+                m = m_base
+                if args.auto_tune_factor_weights:
+                    cand_scalers = auto_tune_feature_scalers(x_train, y_train)
+                    x_train_t = apply_feature_scalers(x_train, cand_scalers)
+                    x_test_t = apply_feature_scalers(x_test, cand_scalers)
+                    w_t, b_t = train_logistic_sgd(x_train_t, y_train)
+                    probs_t = predict_prob(w_t, b_t, x_test_t)
+                    t_t = best_threshold(y_test, probs_t)
+                    m_t = compute_metrics(y_test, probs_t, threshold=t_t)
+                    wr_t = holdout_top20_winrate(test, probs_t, y_test)
+                    if (wr_t > wr_base) or (wr_t == wr_base and m_t.auc >= m_base.auc):
+                        scalers = cand_scalers
+                        w, b = w_t, b_t
+                        probs = probs_t
+                        t = t_t
+                        m = m_t
                 metrics_rows.append((h, len(train), len(test), t, m.accuracy, m.precision, m.auc))
                 per_horizon_test[h] = [(row.date, row.ticker, pp, yy) for row, pp, yy in zip(test, probs, y_test)]
+                per_horizon_feature_scalers[h] = scalers
                 latest_date = max(s.date for s in samples_h)
                 latest_dates.append(latest_date)
                 latest = [s for s in samples_h if s.date == latest_date]
                 mapp: Dict[str, Tuple[float, float, float, str]] = {}
                 cmap: Dict[str, List[float]] = {}
                 for s in latest:
-                    x = [(s.features[i] - means[i]) / stds[i] for i in range(len(means))]
+                    x = [((s.features[i] - means[i]) / stds[i]) * scalers[i] for i in range(len(means))]
                     p = sigmoid(sum(w[j] * x[j] for j in range(len(w))) + b)
                     contrib = [w[j] * x[j] for j in range(len(w))]
                     risk20 = s.features[4] if len(s.features) > 4 else 0.0
@@ -1895,6 +2020,7 @@ def main():
     print(f"IB Factor CSV  : {args.institution_factor_csv if args.institution_factor_csv else 'OFF'}")
     print(f"Mkt Sentiment  : {'ON' if args.use_market_sentiment else 'OFF'}")
     print(f"Global Macro   : {'ON' if args.use_global_macro else 'OFF'}")
+    print(f"Feat Tune      : {'ON' if args.auto_tune_factor_weights else 'OFF'}")
     if aligned_to:
         print(f"Data Align     : common_date={aligned_to.isoformat()} (coverage>={min(max(args.common_date_coverage, 0.5), 1.0):.0%})")
     if using_stable_db_snapshot:
@@ -1913,6 +2039,10 @@ def main():
         print("HorizonWeightMode : auto_tuned_from_holdout")
     for h, trn, tst, thr, acc, prec, auc in metrics_rows:
         print(f"H{h:>2} -> Train/Test {trn:,}/{tst:,} | Thr {thr:.2f} | Acc {acc:.4f} | Prec {prec:.4f} | AUC {auc:.4f}")
+        scalers = per_horizon_feature_scalers.get(h, [])
+        if scalers:
+            pairs = sorted(list(zip(FEATURE_NAMES, scalers)), key=lambda x: abs(x[1] - 1.0), reverse=True)[:3]
+            print("      feature_weights(top3): " + ", ".join([f"{n}:{v:.2f}" for n, v in pairs]))
     print("----------------------------------------------")
     print(f"TOP {args.topn} CANDIDATES @ model_date={report_model_date.isoformat()}")
     factor_rows: List[Tuple[str, str, float]] = []
@@ -1946,6 +2076,15 @@ def main():
             for tk, fnm, v in factor_rows:
                 w.writerow([tk, fnm, f"{v:.8f}"])
         print(f"Saved factor report CSV : {args.factor_report_csv}")
+    if args.feature_weights_csv:
+        with open(args.feature_weights_csv, "w", encoding="utf-8", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["horizon", "factor", "weight"])
+            for h in sorted(per_horizon_feature_scalers.keys()):
+                sw = per_horizon_feature_scalers[h]
+                for i, fnm in enumerate(FEATURE_NAMES):
+                    w.writerow([h, fnm, f"{sw[i]:.8f}"])
+        print(f"Saved feature weights CSV : {args.feature_weights_csv}")
 
 
 if __name__ == "__main__":

@@ -42,6 +42,8 @@ python quant_alpha_system.py
 - `--min-samples 500`（每个 horizon 最低样本门槛；ETF 模式默认自动放宽到 180）
 - `--report-csv one_year_report.csv`（导出近1年每日胜率报告）
 - `--factor-report-csv topn_factor_report.csv`（导出 TopN 因子贡献明细）
+- `--auto-tune-factor-weights`（默认开启：自动搜索特征权重，并以 holdout Top20% 胜率不劣于基线为准）
+- `--feature-weights-csv feature_weights.csv`（导出各 horizon 的特征权重）
 - `--institution-factor-csv ib_top5_factor.csv`（可选：外资投行 Top5 持仓因子，列为 `date,ticker,score`）
 - `--use-institution-factor`（默认开启；若未指定路径会自动尝试读取当前目录 `ib_top5_factor.csv`）
 - `--use-market-sentiment`（默认开启：市场情绪因子，如 breadth/基准趋势）

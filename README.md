@@ -209,6 +209,7 @@ http://127.0.0.1:8000
 - 可视化配置 Walk-forward 参数：`WF 训练天数/测试天数/步长天数`
 - 在线展示 `quant_alpha_system.py` 的完整输出
 - 当开启 Walk-forward 时，Web 端会自动绘制：日胜率、累计胜率、月度胜率图
+- Web 端支持一键导出 Walk-forward 图表截图（PNG）
 
 ## 6) 这次算法/工程升级点
 

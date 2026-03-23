@@ -172,6 +172,7 @@ PAGE = """<!doctype html>
   <div class="card">
     <h3>Walk-forward 图表</h3>
     <div id="wf_hint">运行后若开启 walk-forward，将展示日胜率、累计胜率、月度胜率。</div>
+    <button onclick="exportWalkForwardSnapshot()">导出图表截图（PNG）</button>
     <canvas id="wf_daily_chart" width="920" height="220"></canvas>
     <canvas id="wf_monthly_chart" width="920" height="220" style="margin-top:10px;"></canvas>
   </div>
@@ -334,6 +335,45 @@ function renderWalkForward(report) {
     0,
     1
   );
+}
+
+function exportWalkForwardSnapshot() {
+  const dailyCanvas = document.getElementById('wf_daily_chart');
+  const monthlyCanvas = document.getElementById('wf_monthly_chart');
+  const hint = document.getElementById('wf_hint').textContent || '';
+  const out = document.getElementById('out').textContent || '';
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+
+  const W = 980;
+  const H = 620;
+  const c = document.createElement('canvas');
+  c.width = W;
+  c.height = H;
+  const ctx = c.getContext('2d');
+  ctx.fillStyle = '#fff';
+  ctx.fillRect(0, 0, W, H);
+
+  ctx.fillStyle = '#111';
+  ctx.font = 'bold 20px Arial';
+  ctx.fillText('A/H Alpha Walk-forward Snapshot', 24, 34);
+
+  ctx.fillStyle = '#444';
+  ctx.font = '13px Arial';
+  ctx.fillText(hint.slice(0, 120), 24, 58);
+
+  ctx.drawImage(dailyCanvas, 24, 78, 920, 220);
+  ctx.drawImage(monthlyCanvas, 24, 308, 920, 220);
+
+  ctx.fillStyle = '#666';
+  ctx.font = '12px Arial';
+  const tail = out.split('\\n').slice(-3).join(' | ').slice(0, 140);
+  ctx.fillText('output tail: ' + tail, 24, 562);
+  ctx.fillText('generated: ' + new Date().toLocaleString(), 24, 584);
+
+  const a = document.createElement('a');
+  a.href = c.toDataURL('image/png');
+  a.download = `wf_snapshot_${stamp}.png`;
+  a.click();
 }
 </script>
 </body>

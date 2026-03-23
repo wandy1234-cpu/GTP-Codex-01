@@ -56,6 +56,23 @@ PAGE = """<!doctype html>
           <option value="0">否</option>
         </select>
       </div>
+      <div>
+        <label>考虑市场情绪因子</label>
+        <select id="use_market_sentiment">
+          <option value="1">是（默认）</option>
+          <option value="0">否</option>
+        </select>
+      </div>
+    </div>
+
+    <div class="row">
+      <div>
+        <label>考虑全球宏观因子</label>
+        <select id="use_global_macro">
+          <option value="1">是（默认）</option>
+          <option value="0">否</option>
+        </select>
+      </div>
       <div></div>
     </div>
 
@@ -135,6 +152,8 @@ async function run() {
     topn: document.getElementById('topn').value,
     csv: document.getElementById('csv').value,
     use_institution_factor: document.getElementById('use_institution_factor').value,
+    use_market_sentiment: document.getElementById('use_market_sentiment').value,
+    use_global_macro: document.getElementById('use_global_macro').value,
     benchmark: document.getElementById('benchmark').value,
     providers: document.getElementById('providers').value,
     max_weight: document.getElementById('max_weight').value,
@@ -209,6 +228,8 @@ class Handler(BaseHTTPRequestHandler):
         cn_etf_limit = str(payload.get("cn_etf_limit", "200"))
         csv_path = str(payload.get("csv", "")).strip()
         use_institution_factor = str(payload.get("use_institution_factor", "1"))
+        use_market_sentiment = str(payload.get("use_market_sentiment", "1"))
+        use_global_macro = str(payload.get("use_global_macro", "1"))
 
         cmd = [
             "python",
@@ -234,6 +255,14 @@ class Handler(BaseHTTPRequestHandler):
             cmd.append("--use-institution-factor")
         else:
             cmd.append("--no-use-institution-factor")
+        if use_market_sentiment == "1":
+            cmd.append("--use-market-sentiment")
+        else:
+            cmd.append("--no-use-market-sentiment")
+        if use_global_macro == "1":
+            cmd.append("--use-global-macro")
+        else:
+            cmd.append("--no-use-global-macro")
 
         if mode == "demo":
             cmd.append("--demo")

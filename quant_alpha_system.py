@@ -58,6 +58,10 @@ FEATURE_NAMES = [
     "ma_gap_10_30",
     "price_pos_20d",
     "ib_top5_score",
+    "mkt_breadth_5d",
+    "bm_trend_5d",
+    "oil_ret_5d",
+    "vix_ret_5d",
 ]
 
 DEFAULT_TICKERS = [
@@ -879,11 +883,96 @@ def build_benchmark_close_map(data: Dict[str, List[Row]], benchmark_ticker: str)
     return {r.date: r.close for r in rows}
 
 
+def build_market_sentiment_map(
+    data: Dict[str, List[Row]], benchmark_ticker: str
+) -> Dict[dt.date, Tuple[float, float]]:
+    """
+    Returns date -> (market breadth, benchmark trend5d)
+    - breadth: fraction of stocks up on the date minus 0.5 (centered)
+    - benchmark trend5d: benchmark close/close[-5]-1
+    """
+    by_ticker_close = {tk: {r.date: r.close for r in rows} for tk, rows in data.items()}
+    all_dates = sorted({d for mp in by_ticker_close.values() for d in mp.keys()})
+    out: Dict[dt.date, Tuple[float, float]] = {}
+    bm_rows = data.get(benchmark_ticker, [])
+    bm_close = [r.close for r in bm_rows]
+    bm_date_to_idx = {r.date: i for i, r in enumerate(bm_rows)}
+    for d in all_dates:
+        up = 0
+        total = 0
+        for tk, mp in by_ticker_close.items():
+            if tk == benchmark_ticker:
+                continue
+            if d not in mp:
+                continue
+            prev_dates = [x for x in mp.keys() if x < d]
+            if not prev_dates:
+                continue
+            pd = prev_dates[-1]
+            c0 = mp[pd]
+            c1 = mp[d]
+            if c0 <= 0:
+                continue
+            total += 1
+            if c1 / c0 - 1.0 > 0:
+                up += 1
+        breadth = (up / total - 0.5) if total else 0.0
+
+        bm_trend = 0.0
+        idx = bm_date_to_idx.get(d)
+        if idx is not None and idx >= 5 and bm_close[idx - 5] > 0:
+            bm_trend = bm_close[idx] / bm_close[idx - 5] - 1.0
+        out[d] = (breadth, bm_trend)
+    return out
+
+
+def build_global_macro_map(start: dt.date, end: dt.date) -> Dict[dt.date, Tuple[float, float]]:
+    """
+    Returns date -> (oil_ret_5d, vix_ret_5d), aligned by available dates.
+    Data source: Yahoo symbols CL=F (oil), ^VIX (risk sentiment proxy).
+    """
+    out: Dict[dt.date, Tuple[float, float]] = {}
+    try:
+        oil_rows = fetch_yahoo_history("CL=F", start - dt.timedelta(days=20), end)
+        vix_rows = fetch_yahoo_history("^VIX", start - dt.timedelta(days=20), end)
+    except Exception:
+        return out
+
+    oil = {r.date: r.close for r in oil_rows}
+    vix = {r.date: r.close for r in vix_rows}
+    dates = sorted(set(oil.keys()) | set(vix.keys()))
+    for i, d in enumerate(dates):
+        oil_ret5 = 0.0
+        vix_ret5 = 0.0
+        if d in oil and i >= 5:
+            d0 = dates[i - 5]
+            if d0 in oil and oil[d0] > 0:
+                oil_ret5 = oil[d] / oil[d0] - 1.0
+        if d in vix and i >= 5:
+            d0 = dates[i - 5]
+            if d0 in vix and vix[d0] > 0:
+                vix_ret5 = vix[d] / vix[d0] - 1.0
+        out[d] = (oil_ret5, vix_ret5)
+    return out
+
+
+def get_context_by_date(ctx: Dict[dt.date, Tuple[float, ...]], asof: dt.date, n: int) -> Tuple[float, ...]:
+    if not ctx:
+        return tuple(0.0 for _ in range(n))
+    dates = sorted(ctx.keys())
+    idx = bisect_right(dates, asof) - 1
+    if idx < 0:
+        return tuple(0.0 for _ in range(n))
+    return ctx.get(dates[idx], tuple(0.0 for _ in range(n)))
+
+
 def build_samples(
     data: Dict[str, List[Row]],
     horizon: int,
     benchmark_ticker: str,
     institutional_factor: Optional[Dict[str, List[Tuple[dt.date, float]]]] = None,
+    market_sentiment_map: Optional[Dict[dt.date, Tuple[float, float]]] = None,
+    global_macro_map: Optional[Dict[dt.date, Tuple[float, float]]] = None,
 ) -> List[Sample]:
     samples: List[Sample] = []
     eps = 1e-9
@@ -918,6 +1007,14 @@ def build_samples(
                 if institutional_factor
                 else 0.0
             )
+            if market_sentiment_map:
+                mkt_breadth_5d, bm_trend_5d = get_context_by_date(market_sentiment_map, rows[i].date, 2)
+            else:
+                mkt_breadth_5d, bm_trend_5d = 0.0, 0.0
+            if global_macro_map:
+                oil_ret_5d, vix_ret_5d = get_context_by_date(global_macro_map, rows[i].date, 2)
+            else:
+                oil_ret_5d, vix_ret_5d = 0.0, 0.0
             future_ret = closes[i + horizon] / closes[i] - 1.0
             # v6: 以“同起止日期的超额收益”作为标签，更贴近指数增强目标
             d0 = rows[i].date
@@ -932,7 +1029,21 @@ def build_samples(
                 Sample(
                     date=rows[i].date,
                     ticker=ticker,
-                    features=[ret_1d, ret_5d, ret_20d, rel_ret_5d, vol_20d, vol_ratio, ma_gap, pos20, ib_score],
+                    features=[
+                        ret_1d,
+                        ret_5d,
+                        ret_20d,
+                        rel_ret_5d,
+                        vol_20d,
+                        vol_ratio,
+                        ma_gap,
+                        pos20,
+                        ib_score,
+                        mkt_breadth_5d,
+                        bm_trend_5d,
+                        oil_ret_5d,
+                        vix_ret_5d,
+                    ],
                     target=target,
                     close=closes[i],
                 )
@@ -1369,6 +1480,32 @@ def main():
         action="store_false",
         help="Disable top-5 foreign IB holdings factor.",
     )
+    parser.set_defaults(use_market_sentiment=True)
+    parser.add_argument(
+        "--use-market-sentiment",
+        dest="use_market_sentiment",
+        action="store_true",
+        help="Enable market sentiment factors (breadth/trend) (default ON).",
+    )
+    parser.add_argument(
+        "--no-use-market-sentiment",
+        dest="use_market_sentiment",
+        action="store_false",
+        help="Disable market sentiment factors.",
+    )
+    parser.set_defaults(use_global_macro=True)
+    parser.add_argument(
+        "--use-global-macro",
+        dest="use_global_macro",
+        action="store_true",
+        help="Enable global macro factors (oil/VIX) (default ON).",
+    )
+    parser.add_argument(
+        "--no-use-global-macro",
+        dest="use_global_macro",
+        action="store_false",
+        help="Disable global macro factors.",
+    )
     parser.add_argument(
         "--tickers",
         type=str,
@@ -1444,6 +1581,8 @@ def main():
     latest_quote: Dict[str, Tuple[float, dt.datetime]] = {}
     runtime_names: Dict[str, str] = {}
     institutional_factor: Dict[str, List[Tuple[dt.date, float]]] = {}
+    market_sentiment_map: Dict[dt.date, Tuple[float, float]] = {}
+    global_macro_map: Dict[dt.date, Tuple[float, float]] = {}
 
     if args.use_institution_factor:
         factor_path = args.institution_factor_csv.strip()
@@ -1550,6 +1689,14 @@ def main():
                 data, aligned_to = align_data_to_common_date(db_view, min_coverage_ratio=cov)
                 using_stable_db_snapshot = True
 
+    if args.use_market_sentiment:
+        market_sentiment_map = build_market_sentiment_map(data, args.benchmark)
+    if args.use_global_macro:
+        if data:
+            all_dates = sorted({r.date for rows in data.values() for r in rows})
+            if all_dates:
+                global_macro_map = build_global_macro_map(all_dates[0], all_dates[-1])
+
     horizons = parse_int_list(args.horizons) or [args.horizon]
     h_weights = normalize_weights(parse_float_list(args.horizon_weights), len(horizons))
 
@@ -1565,7 +1712,12 @@ def main():
 
     for h in horizons:
         samples_h = build_samples(
-            data, horizon=h, benchmark_ticker=args.benchmark, institutional_factor=institutional_factor
+            data,
+            horizon=h,
+            benchmark_ticker=args.benchmark,
+            institutional_factor=institutional_factor,
+            market_sentiment_map=market_sentiment_map,
+            global_macro_map=global_macro_map,
         )
         if len(samples_h) < min_samples_required:
             continue
@@ -1604,7 +1756,12 @@ def main():
         print("[WARN] ETF mode: multi-horizon samples insufficient, fallback to single horizon=5 with relaxed threshold.")
         h = 5
         samples_h = build_samples(
-            data, horizon=h, benchmark_ticker=args.benchmark, institutional_factor=institutional_factor
+            data,
+            horizon=h,
+            benchmark_ticker=args.benchmark,
+            institutional_factor=institutional_factor,
+            market_sentiment_map=market_sentiment_map,
+            global_macro_map=global_macro_map,
         )
         if len(samples_h) >= 120:
             train, test = train_test_split(samples_h, split_ratio=0.8)
@@ -1696,6 +1853,8 @@ def main():
     print(f"Run Time (UTC) : {run_ts}")
     print(f"Data Source    : {source}")
     print(f"IB Factor CSV  : {args.institution_factor_csv if args.institution_factor_csv else 'OFF'}")
+    print(f"Mkt Sentiment  : {'ON' if args.use_market_sentiment else 'OFF'}")
+    print(f"Global Macro   : {'ON' if args.use_global_macro else 'OFF'}")
     if aligned_to:
         print(f"Data Align     : common_date={aligned_to.isoformat()} (coverage>={min(max(args.common_date_coverage, 0.5), 1.0):.0%})")
     if using_stable_db_snapshot:

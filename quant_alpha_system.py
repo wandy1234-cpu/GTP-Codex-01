@@ -62,6 +62,9 @@ FEATURE_NAMES = [
     "bm_trend_5d",
     "oil_ret_5d",
     "vix_ret_5d",
+    "ret_60d",
+    "downside_vol_20d",
+    "drawdown_20d",
 ]
 
 DEFAULT_TICKERS = [
@@ -987,14 +990,17 @@ def build_samples(
         lows = [r.low for r in rows]
         vols = [r.volume for r in rows]
 
-        for i in range(30, len(rows) - horizon):
+        for i in range(60, len(rows) - horizon):
             ret_1d = closes[i] / closes[i - 1] - 1.0
             ret_5d = closes[i] / closes[i - 5] - 1.0
             ret_20d = closes[i] / closes[i - 20] - 1.0
+            ret_60d = closes[i] / closes[i - 60] - 1.0
             bm_ret_5d = bm_5d_ret.get(rows[i].date, 0.0)
             rel_ret_5d = ret_5d - bm_ret_5d
             daily_rets = [closes[j] / closes[j - 1] - 1.0 for j in range(i - 19, i + 1)]
             vol_20d = rolling_std(daily_rets)
+            neg_rets = [r for r in daily_rets if r < 0]
+            downside_vol_20d = rolling_std(neg_rets) if neg_rets else 0.0
             vol_ratio = vols[i] / (rolling_mean(vols[i - 19 : i + 1]) + eps)
             ma10 = rolling_mean(closes[i - 9 : i + 1])
             ma30 = rolling_mean(closes[i - 29 : i + 1])
@@ -1002,6 +1008,7 @@ def build_samples(
             low20 = min(lows[i - 19 : i + 1])
             high20 = max(highs[i - 19 : i + 1])
             pos20 = (closes[i] - low20) / (high20 - low20 + eps)
+            drawdown_20d = closes[i] / (high20 + eps) - 1.0
             ib_score = (
                 get_institutional_score(institutional_factor, ticker, rows[i].date)
                 if institutional_factor
@@ -1043,6 +1050,9 @@ def build_samples(
                         bm_trend_5d,
                         oil_ret_5d,
                         vix_ret_5d,
+                        ret_60d,
+                        downside_vol_20d,
+                        drawdown_20d,
                     ],
                     target=target,
                     close=closes[i],

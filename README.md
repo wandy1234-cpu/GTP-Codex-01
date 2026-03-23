@@ -41,6 +41,7 @@ python quant_alpha_system.py
 - `--auto-tune-horizon-weights`（根据 holdout 回测胜率自动反推多周期融合权重）
 - `--min-samples 500`（每个 horizon 最低样本门槛；ETF 模式默认自动放宽到 180）
 - `--report-csv one_year_report.csv`（导出近1年每日胜率报告）
+- `--factor-report-csv topn_factor_report.csv`（导出 TopN 因子贡献明细）
 - `--institution-factor-csv ib_top5_factor.csv`（可选：外资投行 Top5 持仓因子，列为 `date,ticker,score`）
 - `--use-institution-factor`（默认开启；若未指定路径会自动尝试读取当前目录 `ib_top5_factor.csv`）
 - `--use-market-sentiment`（默认开启：市场情绪因子，如 breadth/基准趋势）
@@ -198,6 +199,7 @@ http://127.0.0.1:8000
 - 支持“是否考虑外资投行因子”下拉（默认：是）
 - 支持“是否考虑市场情绪因子”“是否考虑全球宏观因子”下拉（默认：是）
 - Web 页不再显示“外资因子 CSV 路径”输入框；开启因子时会自动读取项目目录下 `ib_top5_factor.csv`
+- 输出中会显示每个 TopN 标的的主要因子贡献（Top3）
 - `请求超时(秒)` / `重试次数` 可视化配置（解决 live 模式超时问题）
 - CSV 路径默认预填：`C:\Users\Admin\Desktop\GTP-Codex-01`
 - 在线展示 `quant_alpha_system.py` 的完整输出

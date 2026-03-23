@@ -1307,6 +1307,12 @@ def normalize_weights(ws: List[float], n: int) -> List[float]:
     return [x / s for x in ws]
 
 
+def top_factor_contributions(contrib: List[float], topk: int = 3) -> List[Tuple[str, float]]:
+    pairs = list(zip(FEATURE_NAMES, contrib))
+    pairs.sort(key=lambda x: abs(x[1]), reverse=True)
+    return pairs[: max(1, topk)]
+
+
 def write_one_year_report(
     path: str,
     horizons: List[int],
@@ -1539,6 +1545,12 @@ def main():
     parser.add_argument("--prev-weights", type=str, default="", help="Previous portfolio weights CSV path (ticker,weight)")
     parser.add_argument("--save-weights", type=str, default="", help="Output CSV path to save new suggested weights")
     parser.add_argument("--report-csv", type=str, default="", help="Export one-year backtest daily win-rate report CSV")
+    parser.add_argument(
+        "--factor-report-csv",
+        type=str,
+        default="",
+        help="Optional CSV output for TopN factor attribution details",
+    )
     parser.add_argument("--db-path", type=str, default="alpha_realtime.db", help="SQLite path for realtime/history cache")
     parser.set_defaults(db_only=False)
     parser.add_argument("--db-only", dest="db_only", action="store_true", help="Run using local realtime database only")
@@ -1701,6 +1713,7 @@ def main():
     h_weights = normalize_weights(parse_float_list(args.horizon_weights), len(horizons))
 
     per_horizon_maps: Dict[int, Dict[str, Tuple[float, float, float, str]]] = {}
+    per_horizon_contrib_maps: Dict[int, Dict[str, List[float]]] = {}
     per_horizon_test: Dict[int, List[Tuple[dt.date, str, float, int]]] = {}
     metrics_rows: List[Tuple[int, int, int, float, float, float, float]] = []
     latest_dates: List[dt.date] = []
@@ -1736,9 +1749,11 @@ def main():
         latest_dates.append(latest_date)
         latest = [s for s in samples_h if s.date == latest_date]
         mapp: Dict[str, Tuple[float, float, float, str]] = {}
+        cmap: Dict[str, List[float]] = {}
         for s in latest:
             x = [(s.features[i] - means[i]) / stds[i] for i in range(len(means))]
             p = sigmoid(sum(w[j] * x[j] for j in range(len(w))) + b)
+            contrib = [w[j] * x[j] for j in range(len(w))]
             risk20 = s.features[4] if len(s.features) > 4 else 0.0
             if latest_quote and s.ticker in latest_quote:
                 px, ts = latest_quote[s.ticker]
@@ -1750,7 +1765,9 @@ def main():
                 else:
                     px, src = s.close, f"daily@{latest_date.isoformat()}"
             mapp[s.ticker] = (px, p, risk20, src)
+            cmap[s.ticker] = contrib
         per_horizon_maps[h] = mapp
+        per_horizon_contrib_maps[h] = cmap
 
     if not per_horizon_maps and args.cn_etf_rotation:
         print("[WARN] ETF mode: multi-horizon samples insufficient, fallback to single horizon=5 with relaxed threshold.")
@@ -1777,9 +1794,11 @@ def main():
                 latest_dates.append(latest_date)
                 latest = [s for s in samples_h if s.date == latest_date]
                 mapp: Dict[str, Tuple[float, float, float, str]] = {}
+                cmap: Dict[str, List[float]] = {}
                 for s in latest:
                     x = [(s.features[i] - means[i]) / stds[i] for i in range(len(means))]
                     p = sigmoid(sum(w[j] * x[j] for j in range(len(w))) + b)
+                    contrib = [w[j] * x[j] for j in range(len(w))]
                     risk20 = s.features[4] if len(s.features) > 4 else 0.0
                     if latest_quote and s.ticker in latest_quote:
                         px, ts = latest_quote[s.ticker]
@@ -1791,7 +1810,9 @@ def main():
                         else:
                             px, src = s.close, f"daily@{latest_date.isoformat()}"
                     mapp[s.ticker] = (px, p, risk20, src)
+                    cmap[s.ticker] = contrib
                 per_horizon_maps[h] = mapp
+                per_horizon_contrib_maps[h] = cmap
                 horizons = [h]
                 h_weights = [1.0]
 
@@ -1806,11 +1827,12 @@ def main():
     if args.auto_tune_horizon_weights:
         h_weights = auto_tune_horizon_weights(horizons, per_horizon_test)
     horizon_weight_map = {h: h_weights[i] for i, h in enumerate(horizons)}
-    ranked_all: List[Tuple[str, float, float, float, str]] = []
+    ranked_all: List[Tuple[str, float, float, float, str, List[float]]] = []
     for tk in tickers_union:
         num = 0.0
         den = 0.0
         picked: Optional[Tuple[float, float, str]] = None
+        agg_contrib = [0.0 for _ in FEATURE_NAMES]
         for h in sorted(per_horizon_maps.keys(), reverse=True):
             mp = per_horizon_maps[h]
             if tk in mp:
@@ -1819,22 +1841,30 @@ def main():
                 num += w_h * p
                 den += w_h
                 picked = choose_latest_display_source(picked, (px, rk, src))
+                c_map = per_horizon_contrib_maps.get(h, {})
+                c = c_map.get(tk)
+                if c and len(c) == len(agg_contrib):
+                    for i in range(len(agg_contrib)):
+                        agg_contrib[i] += w_h * c[i]
         if den <= 0:
             continue
         if picked is None:
             picked = (0.0, 0.0, "N/A")
-        ranked_all.append((tk, picked[0], num / den, picked[1], picked[2]))
+        if den > 0:
+            agg_contrib = [x / den for x in agg_contrib]
+        ranked_all.append((tk, picked[0], num / den, picked[1], picked[2], agg_contrib))
 
     ranked_all.sort(key=lambda x: x[2], reverse=True)
     top = ranked_all[: args.topn]
     while len(top) < args.topn:
-        top.append((f"N/A_{len(top)+1}", 0.0, 0.0, 0.0, "insufficient_universe"))
+        top.append((f"N/A_{len(top)+1}", 0.0, 0.0, 0.0, "insufficient_universe", [0.0 for _ in FEATURE_NAMES]))
     report_model_date = latest_date
-    for _tk, _px, _p, _rk, src in top:
+    for _tk, _px, _p, _rk, src, _c in top:
         report_model_date = max(report_model_date, source_to_date(src, report_model_date))
+    top_for_portfolio = [(tk, px, p, rk, src) for tk, px, p, rk, src, _c in top]
     prev_w = load_prev_weights(args.prev_weights)
     portfolio = build_portfolio(
-        top,
+        top_for_portfolio,
         max_weight=max(min(args.max_weight, 1.0), 0.01),
         risk_aversion=max(args.risk_aversion, 0.0),
         cost_penalty=max(args.cost_penalty, 0.0),
@@ -1875,10 +1905,16 @@ def main():
         print(f"H{h:>2} -> Train/Test {trn:,}/{tst:,} | Thr {thr:.2f} | Acc {acc:.4f} | Prec {prec:.4f} | AUC {auc:.4f}")
     print("----------------------------------------------")
     print(f"TOP {args.topn} CANDIDATES @ model_date={report_model_date.isoformat()}")
-    for tk, px, p, risk20, src in top:
+    factor_rows: List[Tuple[str, str, float]] = []
+    for tk, px, p, risk20, src, contrib in top:
         nm = stock_name(tk, runtime_names)
         shown = f"{tk}({nm})"
         print(f"{shown:26s} px={px:10.3f} up_prob={p:.4f} risk20={risk20:.4f} [{src}]")
+        top_f = top_factor_contributions(contrib, topk=3)
+        fac_txt = ", ".join([f"{n}:{v:+.3f}" for n, v in top_f])
+        print(f"{'':26s} factors -> {fac_txt}")
+        for n, v in top_f:
+            factor_rows.append((tk, n, v))
 
     print("----------------------------------------------")
     print("SUGGESTED PORTFOLIO (alpha+risk+cost)")
@@ -1893,6 +1929,13 @@ def main():
     if args.report_csv:
         print(f"Saved report CSV : {args.report_csv}")
         print(f"One-year Top20% win rate: {report_wr:.4f} (n={report_n})")
+    if args.factor_report_csv:
+        with open(args.factor_report_csv, "w", encoding="utf-8", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["ticker", "factor", "contribution"])
+            for tk, fnm, v in factor_rows:
+                w.writerow([tk, fnm, f"{v:.8f}"])
+        print(f"Saved factor report CSV : {args.factor_report_csv}")
 
 
 if __name__ == "__main__":

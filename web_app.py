@@ -1,10 +1,13 @@
+import csv
 import html
 import json
+import os
 import subprocess
+import tempfile
 import threading
 import webbrowser
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import urlparse
 
 HOST = "127.0.0.1"
 PORT = 8000
@@ -136,8 +139,41 @@ PAGE = """<!doctype html>
         </select>
       </div>
     </div>
+  </div>
 
+  <div class="card">
+    <h3>回测与稳定性</h3>
+    <div class="row">
+      <div>
+        <label>Walk-forward 回测</label>
+        <select id="walk_forward">
+          <option value="1">开启（推荐）</option>
+          <option value="0">关闭</option>
+        </select>
+      </div>
+      <div>
+        <label>WF 训练天数</label>
+        <input id="wf_train_days" value="756" />
+      </div>
+    </div>
+    <div class="row">
+      <div>
+        <label>WF 测试天数</label>
+        <input id="wf_test_days" value="21" />
+      </div>
+      <div>
+        <label>WF 步长天数</label>
+        <input id="wf_step_days" value="21" />
+      </div>
+    </div>
     <button onclick="run()">运行策略</button>
+  </div>
+
+  <div class="card">
+    <h3>Walk-forward 图表</h3>
+    <div id="wf_hint">运行后若开启 walk-forward，将展示日胜率、累计胜率、月度胜率。</div>
+    <canvas id="wf_daily_chart" width="920" height="220"></canvas>
+    <canvas id="wf_monthly_chart" width="920" height="220" style="margin-top:10px;"></canvas>
   </div>
 
   <div class="card">
@@ -165,17 +201,189 @@ async function run() {
     request_retries: document.getElementById('request_retries').value,
     etf_live_limit: document.getElementById('etf_live_limit').value,
     cn_etf_limit: document.getElementById('cn_etf_limit').value,
+    walk_forward: document.getElementById('walk_forward').value,
+    wf_train_days: document.getElementById('wf_train_days').value,
+    wf_test_days: document.getElementById('wf_test_days').value,
+    wf_step_days: document.getElementById('wf_step_days').value,
   };
 
   document.getElementById('out').textContent = '运行中...';
   const res = await fetch('/run', { method: 'POST', body: JSON.stringify(payload) });
   const data = await res.json();
   document.getElementById('out').textContent = data.output || data.error || '无输出';
+  renderWalkForward(data.wf_report || null);
+}
+
+function drawLineChart(canvas, labels, seriesList, yMin, yMax) {
+  const ctx = canvas.getContext('2d');
+  const W = canvas.width, H = canvas.height;
+  ctx.clearRect(0, 0, W, H);
+  ctx.fillStyle = '#fff';
+  ctx.fillRect(0, 0, W, H);
+
+  const pad = { l: 45, r: 10, t: 10, b: 28 };
+  const iw = W - pad.l - pad.r;
+  const ih = H - pad.t - pad.b;
+  ctx.strokeStyle = '#ddd';
+  ctx.beginPath();
+  ctx.rect(pad.l, pad.t, iw, ih);
+  ctx.stroke();
+  for (let k = 0; k <= 4; k++) {
+    const yy = pad.t + (ih * k) / 4;
+    ctx.strokeStyle = '#eee';
+    ctx.beginPath();
+    ctx.moveTo(pad.l, yy);
+    ctx.lineTo(pad.l + iw, yy);
+    ctx.stroke();
+    const v = yMax - ((yMax - yMin) * k) / 4;
+    ctx.fillStyle = '#666';
+    ctx.font = '11px Arial';
+    ctx.fillText((v * 100).toFixed(1) + '%', 4, yy + 4);
+  }
+  if (!labels.length) return;
+
+  function xOf(i) {
+    return pad.l + (iw * i) / Math.max(labels.length - 1, 1);
+  }
+  function yOf(v) {
+    const t = (v - yMin) / Math.max(yMax - yMin, 1e-8);
+    return pad.t + ih * (1 - t);
+  }
+  for (const s of seriesList) {
+    ctx.strokeStyle = s.color;
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    s.values.forEach((v, i) => {
+      const x = xOf(i), y = yOf(v);
+      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    });
+    ctx.stroke();
+  }
+  ctx.fillStyle = '#444';
+  ctx.font = '11px Arial';
+  ctx.fillText(labels[0], pad.l, H - 8);
+  ctx.fillText(labels[labels.length - 1], pad.l + iw - 70, H - 8);
+  let lx = pad.l + 12, ly = pad.t + 14;
+  for (const s of seriesList) {
+    ctx.fillStyle = s.color;
+    ctx.fillRect(lx, ly - 8, 10, 10);
+    ctx.fillStyle = '#333';
+    ctx.fillText(s.name, lx + 14, ly);
+    lx += 150;
+  }
+}
+
+function drawBarChart(canvas, labels, values, yMin, yMax) {
+  const ctx = canvas.getContext('2d');
+  const W = canvas.width, H = canvas.height;
+  ctx.clearRect(0, 0, W, H);
+  ctx.fillStyle = '#fff';
+  ctx.fillRect(0, 0, W, H);
+  const pad = { l: 45, r: 10, t: 10, b: 30 };
+  const iw = W - pad.l - pad.r;
+  const ih = H - pad.t - pad.b;
+  ctx.strokeStyle = '#ddd';
+  ctx.beginPath();
+  ctx.rect(pad.l, pad.t, iw, ih);
+  ctx.stroke();
+  if (!labels.length) return;
+  const bw = iw / labels.length;
+  for (let i = 0; i < labels.length; i++) {
+    const v = values[i];
+    const t = (v - yMin) / Math.max(yMax - yMin, 1e-8);
+    const h = ih * Math.max(0, Math.min(1, t));
+    const x = pad.l + i * bw + bw * 0.15;
+    const y = pad.t + ih - h;
+    ctx.fillStyle = '#4e79a7';
+    ctx.fillRect(x, y, bw * 0.7, h);
+  }
+  const stride = Math.max(1, Math.floor(labels.length / 8));
+  ctx.fillStyle = '#444';
+  ctx.font = '11px Arial';
+  for (let i = 0; i < labels.length; i += stride) {
+    const x = pad.l + i * bw + 2;
+    ctx.fillText(labels[i], x, H - 8);
+  }
+}
+
+function renderWalkForward(report) {
+  const hint = document.getElementById('wf_hint');
+  const dailyCanvas = document.getElementById('wf_daily_chart');
+  const monthlyCanvas = document.getElementById('wf_monthly_chart');
+  if (!report || !report.daily || !report.daily.length) {
+    hint.textContent = '无 walk-forward 结果（可能关闭了该选项或样本不足）。';
+    const c1 = dailyCanvas.getContext('2d'); c1.clearRect(0, 0, dailyCanvas.width, dailyCanvas.height);
+    const c2 = monthlyCanvas.getContext('2d'); c2.clearRect(0, 0, monthlyCanvas.width, monthlyCanvas.height);
+    return;
+  }
+  hint.textContent = `overall: ${(report.overall_win_rate * 100).toFixed(2)}% | n=${report.selected_count}（当前版本暂不提供“权重漂移”曲线）`;
+  const labels = report.daily.map(r => r.date);
+  const daily = report.daily.map(r => r.daily_win_rate);
+  const cumu = report.daily.map(r => r.cumulative_win_rate);
+  drawLineChart(
+    dailyCanvas,
+    labels,
+    [{ name: '日胜率', values: daily, color: '#4e79a7' }, { name: '累计胜率', values: cumu, color: '#f28e2b' }],
+    0,
+    1
+  );
+  drawBarChart(
+    monthlyCanvas,
+    report.monthly.map(r => r.month),
+    report.monthly.map(r => r.monthly_win_rate),
+    0,
+    1
+  );
 }
 </script>
 </body>
 </html>
 """
+
+
+def parse_walk_forward_csv(path: str):
+    daily = []
+    with open(path, "r", encoding="utf-8") as f:
+        rows = list(csv.reader(f))
+
+    for row in rows[1:]:
+        if not row:
+            break
+        if len(row) < 4:
+            continue
+        day, sel, wins, wr = row[0], int(row[1]), int(row[2]), float(row[3])
+        daily.append({"date": day, "selected_count": sel, "wins": wins, "daily_win_rate": wr})
+
+    if not daily:
+        return None
+
+    cum_wins = 0
+    cum_sel = 0
+    for rec in daily:
+        cum_wins += rec["wins"]
+        cum_sel += rec["selected_count"]
+        rec["cumulative_win_rate"] = (cum_wins / cum_sel) if cum_sel else 0.0
+
+    by_month = {}
+    for rec in daily:
+        month = rec["date"][:7]
+        if month not in by_month:
+            by_month[month] = {"sel": 0, "wins": 0}
+        by_month[month]["sel"] += rec["selected_count"]
+        by_month[month]["wins"] += rec["wins"]
+
+    monthly = []
+    for month in sorted(by_month.keys()):
+        sel = by_month[month]["sel"]
+        wins = by_month[month]["wins"]
+        monthly.append({"month": month, "selected_count": sel, "wins": wins, "monthly_win_rate": (wins / sel) if sel else 0.0})
+
+    return {
+        "daily": daily,
+        "monthly": monthly,
+        "overall_win_rate": daily[-1]["cumulative_win_rate"],
+        "selected_count": cum_sel,
+    }
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -230,6 +438,10 @@ class Handler(BaseHTTPRequestHandler):
         use_institution_factor = str(payload.get("use_institution_factor", "1"))
         use_market_sentiment = str(payload.get("use_market_sentiment", "1"))
         use_global_macro = str(payload.get("use_global_macro", "1"))
+        walk_forward = str(payload.get("walk_forward", "1"))
+        wf_train_days = str(payload.get("wf_train_days", "756"))
+        wf_test_days = str(payload.get("wf_test_days", "21"))
+        wf_step_days = str(payload.get("wf_step_days", "21"))
 
         cmd = [
             "python",
@@ -298,15 +510,40 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json({"error": f"未知模式: {html.escape(mode)}"}, 400)
             return
 
+        wf_tmp_path = None
+        if walk_forward == "1":
+            wf_tmp = tempfile.NamedTemporaryFile(prefix="wf_", suffix=".csv", delete=False)
+            wf_tmp.close()
+            wf_tmp_path = wf_tmp.name
+            cmd.extend(
+                [
+                    "--walk-forward",
+                    "--wf-train-days",
+                    wf_train_days,
+                    "--wf-test-days",
+                    wf_test_days,
+                    "--wf-step-days",
+                    wf_step_days,
+                    "--walk-forward-csv",
+                    wf_tmp_path,
+                ]
+            )
+
         try:
             p = subprocess.run(cmd, capture_output=True, text=True, timeout=STRATEGY_TIMEOUT_SECONDS)
             output = (p.stdout or "") + ("\n" + p.stderr if p.stderr else "")
-            self._send_json({"output": output, "returncode": p.returncode})
+            wf_report = None
+            if wf_tmp_path and os.path.exists(wf_tmp_path) and os.path.getsize(wf_tmp_path) > 0:
+                wf_report = parse_walk_forward_csv(wf_tmp_path)
+            self._send_json({"output": output, "returncode": p.returncode, "wf_report": wf_report})
         except subprocess.TimeoutExpired:
             self._send_json(
                 {"error": f"运行超时（{STRATEGY_TIMEOUT_SECONDS}秒）: 请缩小股票池、降低重试次数，或改用 DB Only。"},
                 500,
             )
+        finally:
+            if wf_tmp_path and os.path.exists(wf_tmp_path):
+                os.remove(wf_tmp_path)
 
 
 def main():

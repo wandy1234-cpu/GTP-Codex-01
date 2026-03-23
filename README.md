@@ -206,7 +206,9 @@ http://127.0.0.1:8000
 - 输出中会显示每个 TopN 标的的主要因子贡献（Top3）
 - `请求超时(秒)` / `重试次数` 可视化配置（解决 live 模式超时问题）
 - CSV 路径默认预填：`C:\Users\Admin\Desktop\GTP-Codex-01`
+- 可视化配置 Walk-forward 参数：`WF 训练天数/测试天数/步长天数`
 - 在线展示 `quant_alpha_system.py` 的完整输出
+- 当开启 Walk-forward 时，Web 端会自动绘制：日胜率、累计胜率、月度胜率图
 
 ## 6) 这次算法/工程升级点
 

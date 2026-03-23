@@ -1435,6 +1435,64 @@ def write_one_year_report(
     return overall_wr, total_sel
 
 
+def run_walk_forward_horizon(
+    samples: List[Sample],
+    auto_tune_factor_weights: bool,
+    train_days: int = 756,
+    test_days: int = 21,
+    step_days: int = 21,
+) -> List[Tuple[dt.date, str, float, int]]:
+    """
+    Rolling walk-forward predictions for one horizon.
+    Returns tuples of (date, ticker, prob, y_true) on out-of-sample windows.
+    """
+    if len(samples) < 200:
+        return []
+    dates = sorted({s.date for s in samples})
+    out: List[Tuple[dt.date, str, float, int]] = []
+    for split in range(train_days, len(dates) - test_days + 1, max(step_days, 1)):
+        train_set = set(dates[split - train_days : split])
+        test_set = set(dates[split : split + test_days])
+        train = [s for s in samples if s.date in train_set]
+        test = [s for s in samples if s.date in test_set]
+        if len(train) < 120 or len(test) < 20:
+            continue
+        x_train, y_train, x_test, y_test, _means, _stds = standardize(train, test)
+
+        base_scalers = [1.0] * len(FEATURE_NAMES)
+        x_train_base = apply_feature_scalers(x_train, base_scalers)
+        x_test_base = apply_feature_scalers(x_test, base_scalers)
+        w_base, b_base = train_logistic_sgd(x_train_base, y_train)
+        probs_base = predict_prob(w_base, b_base, x_test_base)
+        wr_base = holdout_top20_winrate(test, probs_base, y_test)
+        m_base = compute_metrics(y_test, probs_base, threshold=best_threshold(y_test, probs_base))
+
+        probs = probs_base
+        if auto_tune_factor_weights:
+            cand_scalers = auto_tune_feature_scalers(x_train, y_train)
+            x_train_t = apply_feature_scalers(x_train, cand_scalers)
+            x_test_t = apply_feature_scalers(x_test, cand_scalers)
+            w_t, b_t = train_logistic_sgd(x_train_t, y_train)
+            probs_t = predict_prob(w_t, b_t, x_test_t)
+            wr_t = holdout_top20_winrate(test, probs_t, y_test)
+            m_t = compute_metrics(y_test, probs_t, threshold=best_threshold(y_test, probs_t))
+            if (wr_t > wr_base) or (wr_t == wr_base and m_t.auc >= m_base.auc):
+                probs = probs_t
+
+        out.extend([(s.date, s.ticker, p, y) for s, p, y in zip(test, probs, y_test)])
+    return out
+
+
+def write_walk_forward_report(
+    path: str,
+    horizons: List[int],
+    horizon_weight_map: Dict[int, float],
+    wf_preds: Dict[int, List[Tuple[dt.date, str, float, int]]],
+) -> Tuple[float, int]:
+    # Reuse aggregation logic from one-year report
+    return write_one_year_report(path, horizons, horizon_weight_map, wf_preds)
+
+
 def auto_tune_horizon_weights(
     horizons: List[int],
     per_horizon_test: Dict[int, List[Tuple[dt.date, str, float, int]]],
@@ -1619,6 +1677,11 @@ def main():
         default="",
         help="Optional CSV output for auto-tuned feature scaling weights by horizon",
     )
+    parser.add_argument("--walk-forward", action="store_true", help="Run rolling walk-forward backtest summary")
+    parser.add_argument("--wf-train-days", type=int, default=756, help="Walk-forward training window (trading days)")
+    parser.add_argument("--wf-test-days", type=int, default=21, help="Walk-forward test window (trading days)")
+    parser.add_argument("--wf-step-days", type=int, default=21, help="Walk-forward step size (trading days)")
+    parser.add_argument("--walk-forward-csv", type=str, default="", help="Output CSV for walk-forward daily win-rate report")
     parser.add_argument("--db-path", type=str, default="alpha_realtime.db", help="SQLite path for realtime/history cache")
     parser.set_defaults(db_only=False)
     parser.add_argument("--db-only", dest="db_only", action="store_true", help="Run using local realtime database only")
@@ -2009,6 +2072,28 @@ def main():
     turnover = estimate_turnover(prev_w, new_w) if prev_w else 0.0
     save_weights(args.save_weights, portfolio)
     report_wr, report_n = write_one_year_report(args.report_csv, horizons, horizon_weight_map, per_horizon_test)
+    wf_wr = 0.0
+    wf_n = 0
+    if args.walk_forward:
+        wf_preds: Dict[int, List[Tuple[dt.date, str, float, int]]] = {}
+        for h in horizons:
+            smp = build_samples(
+                data,
+                horizon=h,
+                benchmark_ticker=args.benchmark,
+                institutional_factor=institutional_factor,
+                market_sentiment_map=market_sentiment_map,
+                global_macro_map=global_macro_map,
+            )
+            wf_preds[h] = run_walk_forward_horizon(
+                smp,
+                auto_tune_factor_weights=args.auto_tune_factor_weights,
+                train_days=max(126, args.wf_train_days),
+                test_days=max(5, args.wf_test_days),
+                step_days=max(1, args.wf_step_days),
+            )
+        wf_path = args.walk_forward_csv if args.walk_forward_csv else ""
+        wf_wr, wf_n = write_walk_forward_report(wf_path, horizons, horizon_weight_map, wf_preds)
 
     run_ts = dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z")
     print("==============================================")
@@ -2069,6 +2154,10 @@ def main():
     if args.report_csv:
         print(f"Saved report CSV : {args.report_csv}")
         print(f"One-year Top20% win rate: {report_wr:.4f} (n={report_n})")
+    if args.walk_forward:
+        if args.walk_forward_csv:
+            print(f"Saved walk-forward CSV : {args.walk_forward_csv}")
+        print(f"Walk-forward Top20% win rate: {wf_wr:.4f} (n={wf_n})")
     if args.factor_report_csv:
         with open(args.factor_report_csv, "w", encoding="utf-8", newline="") as f:
             w = csv.writer(f)

@@ -27,6 +27,8 @@ python quant_alpha_system.py
 - `--benchmark 000300.SS`（默认沪深300，作为超额收益标签基准）
 - `--max-weight 0.35`（单票建议权重上限）
 - `--risk-aversion 0.15`（风险惩罚系数）
+- `--barra-risk-control` / `--no-barra-risk-control`（BARRA 风格因子风控开关，默认开启）
+- `--barra-risk-aversion 0.20`（BARRA 风格风险惩罚系数）
 - `--cost-penalty 0.10`（成本/换手惩罚系数）
 - `--prev-weights prev.csv`（上一期权重，估算换手）
 - `--save-weights out.csv`（保存本期建议权重）
@@ -199,6 +201,7 @@ http://127.0.0.1:8000
 页面支持：
 - `demo` / `live` / `etf` 三种模式
 - TopN、benchmark、providers、max-weight、risk-aversion、cost-penalty 参数可视化配置
+- 支持 BARRA 风控开关与 `barra-risk-aversion` 可视化配置
 - DB Path、DB Only 可视化配置（实时数据库模式）
 - 支持“是否考虑外资投行因子”下拉（默认：是）
 - 支持“是否考虑市场情绪因子”“是否考虑全球宏观因子”下拉（默认：是）
@@ -207,6 +210,7 @@ http://127.0.0.1:8000
 - `请求超时(秒)` / `重试次数` 可视化配置（解决 live 模式超时问题）
 - 可视化配置 Walk-forward 参数：`WF 训练天数/测试天数/步长天数`
 - 在线展示 `quant_alpha_system.py` 的完整输出
+- 点击“运行策略”后按钮会进入“运行中...”状态，避免“点击后无反应”的错觉
 - 当开启 Walk-forward 时，Web 端会自动绘制：日胜率、累计胜率、月度胜率图
 - Web 端支持一键导出 Walk-forward 图表截图（PNG），导出后会显示“已导出”提示与缩略预览
 

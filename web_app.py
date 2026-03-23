@@ -119,6 +119,20 @@ PAGE = """<!doctype html>
       </div>
     </div>
 
+    <div class="row">
+      <div>
+        <label>BARRA 风控</label>
+        <select id="barra_risk_control">
+          <option value="1">开启（默认）</option>
+          <option value="0">关闭</option>
+        </select>
+      </div>
+      <div>
+        <label>BARRA 风险惩罚系数</label>
+        <input id="barra_risk_aversion" value="0.20" />
+      </div>
+    </div>
+
     <label>Cost Penalty</label>
     <input id="cost_penalty" value="0.10" />
 
@@ -162,7 +176,7 @@ PAGE = """<!doctype html>
         <input id="wf_step_days" value="21" />
       </div>
     </div>
-    <button onclick="run()">运行策略</button>
+    <button id="run_btn" onclick="run()">运行策略</button>
   </div>
 
   <div class="card">
@@ -182,6 +196,7 @@ PAGE = """<!doctype html>
 
 <script>
 async function run() {
+  const runBtn = document.getElementById('run_btn');
   const payload = {
     mode: document.getElementById('mode').value,
     topn: document.getElementById('topn').value,
@@ -192,6 +207,8 @@ async function run() {
     providers: document.getElementById('providers').value,
     max_weight: document.getElementById('max_weight').value,
     risk_aversion: document.getElementById('risk_aversion').value,
+    barra_risk_control: document.getElementById('barra_risk_control').value,
+    barra_risk_aversion: document.getElementById('barra_risk_aversion').value,
     cost_penalty: document.getElementById('cost_penalty').value,
     db_path: document.getElementById('db_path').value,
     db_only: document.getElementById('db_only').value,
@@ -205,12 +222,35 @@ async function run() {
     wf_step_days: document.getElementById('wf_step_days').value,
   };
 
-  document.getElementById('out').textContent = '运行中...';
+  runBtn.disabled = true;
+  runBtn.textContent = '运行中...';
+  document.getElementById('out').textContent = '运行中（请稍候，策略可能需要几十秒）...';
   document.getElementById('wf_export_status').textContent = '';
-  const res = await fetch('/run', { method: 'POST', body: JSON.stringify(payload) });
-  const data = await res.json();
-  document.getElementById('out').textContent = data.output || data.error || '无输出';
-  renderWalkForward(data.wf_report || null);
+  try {
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), 260000);
+    const res = await fetch('/run', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+      signal: ctl.signal,
+      headers: { 'Content-Type': 'application/json' },
+    });
+    clearTimeout(timer);
+    const data = await res.json();
+    if (!res.ok) {
+      document.getElementById('out').textContent = data.error || `请求失败: HTTP ${res.status}`;
+      renderWalkForward(null);
+      return;
+    }
+    document.getElementById('out').textContent = data.output || data.error || '无输出';
+    renderWalkForward(data.wf_report || null);
+  } catch (e) {
+    document.getElementById('out').textContent = `请求异常：${e?.message || e}`;
+    renderWalkForward(null);
+  } finally {
+    runBtn.disabled = false;
+    runBtn.textContent = '运行策略';
+  }
 }
 
 function drawLineChart(canvas, labels, seriesList, yMin, yMax) {
@@ -471,6 +511,8 @@ class Handler(BaseHTTPRequestHandler):
         providers = str(payload.get("providers", "eastmoney,tencent,yahoo,stooq"))
         max_weight = str(payload.get("max_weight", "0.20"))
         risk_aversion = str(payload.get("risk_aversion", "0.20"))
+        barra_risk_control = str(payload.get("barra_risk_control", "1"))
+        barra_risk_aversion = str(payload.get("barra_risk_aversion", "0.20"))
         cost_penalty = str(payload.get("cost_penalty", "0.10"))
         db_path = str(payload.get("db_path", "alpha_realtime.db"))
         db_only = str(payload.get("db_only", "0"))
@@ -497,6 +539,8 @@ class Handler(BaseHTTPRequestHandler):
             max_weight,
             "--risk-aversion",
             risk_aversion,
+            "--barra-risk-aversion",
+            barra_risk_aversion,
             "--cost-penalty",
             cost_penalty,
             "--db-path",
@@ -518,6 +562,10 @@ class Handler(BaseHTTPRequestHandler):
             cmd.append("--use-global-macro")
         else:
             cmd.append("--no-use-global-macro")
+        if barra_risk_control == "1":
+            cmd.append("--barra-risk-control")
+        else:
+            cmd.append("--no-barra-risk-control")
 
         if mode == "demo":
             cmd.append("--demo")

@@ -67,6 +67,8 @@ FEATURE_NAMES = [
     "drawdown_20d",
 ]
 
+BARRA_STYLE_FACTORS = ["beta", "momentum", "volatility", "liquidity", "macro"]
+
 DEFAULT_TICKERS = [
     "000300.SS", "600519.SS", "000858.SZ", "601318.SS", "601166.SS", "600036.SS", "600276.SS",
     "601888.SS", "600900.SS", "600031.SS", "300750.SZ", "002594.SZ", "000333.SZ", "002415.SZ",
@@ -1269,14 +1271,14 @@ def load_prev_weights(path: str) -> Dict[str, float]:
     return out
 
 
-def save_weights(path: str, portfolio: List[Tuple[str, float, float, float, str]]) -> None:
+def save_weights(path: str, portfolio: List[Tuple[str, float, float, float, str, float]]) -> None:
     if not path:
         return
     with open(path, "w", encoding="utf-8", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(["ticker", "weight", "up_prob", "risk_20d", "source"])
-        for tk, wt, p, risk, src in portfolio:
-            writer.writerow([tk, f"{wt:.8f}", f"{p:.6f}", f"{risk:.6f}", src])
+        writer.writerow(["ticker", "weight", "up_prob", "risk_20d", "barra_risk", "source"])
+        for tk, wt, p, risk, src, barra_risk in portfolio:
+            writer.writerow([tk, f"{wt:.8f}", f"{p:.6f}", f"{risk:.6f}", f"{barra_risk:.6f}", src])
 
 
 def estimate_turnover(prev_w: Dict[str, float], new_w: Dict[str, float]) -> float:
@@ -1284,25 +1286,61 @@ def estimate_turnover(prev_w: Dict[str, float], new_w: Dict[str, float]) -> floa
     return 0.5 * sum(abs(new_w.get(k, 0.0) - prev_w.get(k, 0.0)) for k in names)
 
 
+def barra_style_exposure_from_contrib(contrib: Sequence[float]) -> Dict[str, float]:
+    m = {k: 0.0 for k in BARRA_STYLE_FACTORS}
+    if len(contrib) != len(FEATURE_NAMES):
+        return m
+    idx = {n: i for i, n in enumerate(FEATURE_NAMES)}
+    # 轻量 BARRA 风格映射（基于现有特征贡献）
+    m["beta"] = 0.7 * contrib[idx["rel_ret_5d"]] + 0.3 * contrib[idx["bm_trend_5d"]]
+    m["momentum"] = 0.25 * contrib[idx["ret_1d"]] + 0.25 * contrib[idx["ret_5d"]] + 0.25 * contrib[idx["ret_20d"]] + 0.25 * contrib[idx["ret_60d"]]
+    m["volatility"] = (
+        0.30 * contrib[idx["vol_20d"]]
+        + 0.20 * contrib[idx["vol_ratio"]]
+        + 0.25 * contrib[idx["downside_vol_20d"]]
+        + 0.25 * abs(contrib[idx["drawdown_20d"]])
+    )
+    m["liquidity"] = -0.6 * contrib[idx["price_pos_20d"]] + 0.4 * contrib[idx["ma_gap_10_30"]]
+    m["macro"] = 0.5 * contrib[idx["oil_ret_5d"]] + 0.5 * contrib[idx["vix_ret_5d"]]
+    return m
+
+
+def barra_risk_score(contrib: Sequence[float], risk20: float) -> float:
+    exp = barra_style_exposure_from_contrib(contrib)
+    style_l2 = math.sqrt(sum(v * v for v in exp.values()))
+    # 风险合成：风格暴露 + 历史波动风险
+    return 0.7 * style_l2 + 0.3 * max(risk20, 0.0)
+
+
 def build_portfolio(
-    top_ranked: List[Tuple[str, float, float, float, str]],
+    top_ranked: List[Tuple[str, float, float, float, str, Sequence[float]]],
     max_weight: float = 0.2,
     risk_aversion: float = 0.15,
     cost_penalty: float = 0.10,
     prev_weights: Optional[Dict[str, float]] = None,
-) -> List[Tuple[str, float, float, float, str]]:
+    use_barra_risk: bool = True,
+    barra_risk_aversion: float = 0.20,
+) -> List[Tuple[str, float, float, float, str, float]]:
     if not top_ranked:
         return []
     prev_weights = prev_weights or {}
 
     scores = []
-    for tk, _, p, risk20, _ in top_ranked:
+    barra_scores = []
+    for tk, _, p, risk20, _src, contrib in top_ranked:
         base_alpha = max(p - 0.5, 0.0)
         trade_cost_proxy = prev_weights.get(tk, 0.0)
-        score = base_alpha - risk_aversion * max(risk20, 0.0) - cost_penalty * max(0.0, 1.0 - trade_cost_proxy)
+        barra_risk = barra_risk_score(contrib, risk20) if use_barra_risk else 0.0
+        score = (
+            base_alpha
+            - risk_aversion * max(risk20, 0.0)
+            - barra_risk_aversion * barra_risk
+            - cost_penalty * max(0.0, 1.0 - trade_cost_proxy)
+        )
         scores.append(max(score, 0.0))
+        barra_scores.append(barra_risk)
     if sum(scores) <= 1e-12:
-        scores = [p for _, _, p, _, _ in top_ranked]
+        scores = [p for _, _, p, _, _, _ in top_ranked]
 
     s = sum(scores)
     w = [x / s for x in scores]
@@ -1314,8 +1352,8 @@ def build_portfolio(
         w = [x / s2 for x in w]
 
     portfolio = []
-    for (tk, _, p, risk20, src), weight in zip(top_ranked, w):
-        portfolio.append((tk, weight, p, risk20, src))
+    for (tk, _, p, risk20, src, _contrib), weight, b_risk in zip(top_ranked, w, barra_scores):
+        portfolio.append((tk, weight, p, risk20, src, b_risk))
     return portfolio
 
 
@@ -1661,6 +1699,20 @@ def main():
     parser.add_argument("--benchmark", type=str, default="000300.SS", help="Benchmark ticker for excess-return label")
     parser.add_argument("--max-weight", type=float, default=0.35, help="Max single-stock weight in suggested portfolio")
     parser.add_argument("--risk-aversion", type=float, default=0.15, help="Penalty coefficient for risk_20d in portfolio scoring")
+    parser.set_defaults(barra_risk_control=True)
+    parser.add_argument(
+        "--barra-risk-control",
+        dest="barra_risk_control",
+        action="store_true",
+        help="Enable lightweight BARRA-style style-factor risk control (default ON).",
+    )
+    parser.add_argument(
+        "--no-barra-risk-control",
+        dest="barra_risk_control",
+        action="store_false",
+        help="Disable BARRA-style risk control.",
+    )
+    parser.add_argument("--barra-risk-aversion", type=float, default=0.20, help="Penalty coefficient for BARRA-style risk score")
     parser.add_argument("--cost-penalty", type=float, default=0.10, help="Penalty coefficient for turnover proxy in scoring")
     parser.add_argument("--prev-weights", type=str, default="", help="Previous portfolio weights CSV path (ticker,weight)")
     parser.add_argument("--save-weights", type=str, default="", help="Output CSV path to save new suggested weights")
@@ -2059,7 +2111,7 @@ def main():
     report_model_date = latest_date
     for _tk, _px, _p, _rk, src, _c in top:
         report_model_date = max(report_model_date, source_to_date(src, report_model_date))
-    top_for_portfolio = [(tk, px, p, rk, src) for tk, px, p, rk, src, _c in top]
+    top_for_portfolio = [(tk, px, p, rk, src, c) for tk, px, p, rk, src, c in top]
     prev_w = load_prev_weights(args.prev_weights)
     portfolio = build_portfolio(
         top_for_portfolio,
@@ -2067,8 +2119,10 @@ def main():
         risk_aversion=max(args.risk_aversion, 0.0),
         cost_penalty=max(args.cost_penalty, 0.0),
         prev_weights=prev_w,
+        use_barra_risk=args.barra_risk_control,
+        barra_risk_aversion=max(args.barra_risk_aversion, 0.0),
     )
-    new_w = {tk: wt for tk, wt, _, _, _ in portfolio}
+    new_w = {tk: wt for tk, wt, _, _, _, _ in portfolio}
     turnover = estimate_turnover(prev_w, new_w) if prev_w else 0.0
     save_weights(args.save_weights, portfolio)
     report_wr, report_n = write_one_year_report(args.report_csv, horizons, horizon_weight_map, per_horizon_test)
@@ -2106,6 +2160,7 @@ def main():
     print(f"Mkt Sentiment  : {'ON' if args.use_market_sentiment else 'OFF'}")
     print(f"Global Macro   : {'ON' if args.use_global_macro else 'OFF'}")
     print(f"Feat Tune      : {'ON' if args.auto_tune_factor_weights else 'OFF'}")
+    print(f"BARRA Risk CTL : {'ON' if args.barra_risk_control else 'OFF'} (lambda={max(args.barra_risk_aversion, 0.0):.2f})")
     if aligned_to:
         print(f"Data Align     : common_date={aligned_to.isoformat()} (coverage>={min(max(args.common_date_coverage, 0.5), 1.0):.0%})")
     if using_stable_db_snapshot:
@@ -2143,10 +2198,10 @@ def main():
 
     print("----------------------------------------------")
     print("SUGGESTED PORTFOLIO (alpha+risk+cost)")
-    for tk, wt, p, risk20, src in portfolio:
+    for tk, wt, p, risk20, src, b_risk in portfolio:
         nm = stock_name(tk, runtime_names)
         shown = f"{tk}({nm})"
-        print(f"{shown:26s} weight={wt:6.2%} up_prob={p:.4f} risk20={risk20:.4f} [{src}]")
+        print(f"{shown:26s} weight={wt:6.2%} up_prob={p:.4f} risk20={risk20:.4f} barra={b_risk:.4f} [{src}]")
     if args.prev_weights:
         print(f"Estimated turnover vs prev portfolio: {turnover:.2%}")
     if args.save_weights:

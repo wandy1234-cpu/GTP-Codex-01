@@ -163,7 +163,7 @@ PAGE = """<!doctype html>
       </div>
       <div>
         <label>WF 训练天数</label>
-        <input id="wf_train_days" value="756" />
+        <input id="wf_train_days" value="252" />
       </div>
     </div>
     <div class="row">
@@ -181,7 +181,7 @@ PAGE = """<!doctype html>
 
   <div class="card">
     <h3>Walk-forward 图表</h3>
-    <div id="wf_hint">运行后若开启 walk-forward，将展示日胜率、累计胜率、月度胜率。</div>
+    <div id="wf_hint">运行后若开启 walk-forward，将展示日胜率、累计胜率、月度胜率（Web 端默认使用 5 日周期加速回测）。</div>
     <button id="wf_export_btn" onclick="exportWalkForwardSnapshot()" disabled>一键导出 Walk-forward 图表截图（PNG）</button>
     <canvas id="wf_daily_chart" width="920" height="220"></canvas>
     <canvas id="wf_monthly_chart" width="920" height="220" style="margin-top:10px;"></canvas>
@@ -524,7 +524,7 @@ class Handler(BaseHTTPRequestHandler):
         use_market_sentiment = str(payload.get("use_market_sentiment", "1"))
         use_global_macro = str(payload.get("use_global_macro", "1"))
         walk_forward = str(payload.get("walk_forward", "0"))
-        wf_train_days = str(payload.get("wf_train_days", "756"))
+        wf_train_days = str(payload.get("wf_train_days", "252"))
         wf_test_days = str(payload.get("wf_test_days", "21"))
         wf_step_days = str(payload.get("wf_step_days", "21"))
 
@@ -603,6 +603,10 @@ class Handler(BaseHTTPRequestHandler):
             wf_tmp_path = wf_tmp.name
             cmd.extend(
                 [
+                    "--horizons",
+                    "5",
+                    "--horizon-weights",
+                    "1",
                     "--walk-forward",
                     "--wf-train-days",
                     wf_train_days,

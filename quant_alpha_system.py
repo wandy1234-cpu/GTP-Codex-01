@@ -1448,9 +1448,6 @@ def write_one_year_report(
     """
     返回 (overall_win_rate, total_selected)
     """
-    if not path:
-        return 0.0, 0
-
     # 聚合多周期测试集概率
     from collections import defaultdict
 
@@ -1489,12 +1486,13 @@ def write_one_year_report(
         rows.append((d.isoformat(), n, wins, wr))
 
     overall_wr = (total_win / total_sel) if total_sel else 0.0
-    with open(path, "w", encoding="utf-8", newline="") as f:
-        w = csv.writer(f)
-        w.writerow(["date", "selected_count", "wins", "daily_win_rate"])
-        w.writerows(rows)
-        w.writerow([])
-        w.writerow(["overall", total_sel, total_win, f"{overall_wr:.6f}"])
+    if path:
+        with open(path, "w", encoding="utf-8", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["date", "selected_count", "wins", "daily_win_rate"])
+            w.writerows(rows)
+            w.writerow([])
+            w.writerow(["overall", total_sel, total_win, f"{overall_wr:.6f}"])
 
     return overall_wr, total_sel
 
@@ -1510,16 +1508,27 @@ def run_walk_forward_horizon(
     Rolling walk-forward predictions for one horizon.
     Returns tuples of (date, ticker, prob, y_true) on out-of-sample windows.
     """
-    if len(samples) < 200:
+    if len(samples) < 40:
         return []
     dates = sorted({s.date for s in samples})
+    if len(dates) < 30:
+        return []
+    test_days_eff = min(max(5, test_days), max(5, len(dates) // 4))
+    max_train = len(dates) - test_days_eff
+    if max_train < 20:
+        return []
+    train_days_eff = min(max(20, train_days), max_train)
+    if train_days_eff >= max_train:
+        train_days_eff = max(20, int(max_train * 0.7))
+    step_days_eff = max(1, min(step_days, test_days_eff))
+
     out: List[Tuple[dt.date, str, float, int]] = []
-    for split in range(train_days, len(dates) - test_days + 1, max(step_days, 1)):
-        train_set = set(dates[split - train_days : split])
-        test_set = set(dates[split : split + test_days])
+    for split in range(train_days_eff, len(dates) - test_days_eff + 1, step_days_eff):
+        train_set = set(dates[split - train_days_eff : split])
+        test_set = set(dates[split : split + test_days_eff])
         train = [s for s in samples if s.date in train_set]
         test = [s for s in samples if s.date in test_set]
-        if len(train) < 120 or len(test) < 20:
+        if len(train) < 30 or len(test) < 10:
             continue
         x_train, y_train, x_test, y_test, _means, _stds = standardize(train, test)
 
@@ -2184,7 +2193,7 @@ def main():
             wf_preds[h] = run_walk_forward_horizon(
                 smp,
                 auto_tune_factor_weights=args.auto_tune_factor_weights,
-                train_days=max(126, args.wf_train_days),
+                train_days=max(40, args.wf_train_days),
                 test_days=max(5, args.wf_test_days),
                 step_days=max(1, args.wf_step_days),
             )

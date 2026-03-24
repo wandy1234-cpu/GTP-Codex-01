@@ -69,7 +69,16 @@ def build_future_excess_map(data: Dict[str, List[q.Row]], benchmark: str, horizo
     return out
 
 
-def evaluate(data, benchmark, horizon, topn, disabled_groups: Set[str], only_groups: Set[str] | None = None):
+def evaluate(
+    data,
+    benchmark,
+    horizon,
+    topn,
+    disabled_groups: Set[str],
+    only_groups: Set[str] | None = None,
+    mode: str = "direct",
+    focus_group: str | None = None,
+):
     mkt = q.build_market_sentiment_map(data, benchmark)
     macro = {}
     samples = q.build_samples(
@@ -97,12 +106,16 @@ def evaluate(data, benchmark, horizon, topn, disabled_groups: Set[str], only_gro
     probs = q.predict_prob(w, b, x_test_mask)
     fex = build_future_excess_map(data, benchmark, horizon)
 
+    idx_map = {f: i for i, f in enumerate(q.FEATURE_NAMES)}
+    fg_idx = [idx_map[f] for f in GROUPS.get(focus_group or "", set()) if f in idx_map]
+
     by_day = defaultdict(list)
-    for s, p in zip(test, probs):
+    for s, p, xv in zip(test, probs, x_test):
         ex = fex.get((s.date, s.ticker))
         if ex is None:
             continue
-        by_day[s.date].append((s.ticker, p, ex))
+        gsig = sum(xv[i] for i in fg_idx) / len(fg_idx) if fg_idx else 0.0
+        by_day[s.date].append((s.ticker, p, ex, gsig))
 
     daily_ret = []
     daily_ic = []
@@ -117,7 +130,20 @@ def evaluate(data, benchmark, horizon, topn, disabled_groups: Set[str], only_gro
     bm_close = {r.date: r.close for r in bm_rows}
     bm_dates = sorted(bm_close.keys())
     for d in sorted(by_day.keys()):
-        arr = sorted(by_day[d], key=lambda x: x[1], reverse=True)
+        arr0 = by_day[d]
+        day_g = sum(x[3] for x in arr0) / max(1, len(arr0))
+        if mode == "filter" and day_g < 0:
+            continue
+        arr = []
+        for tk, p, ex, gsig in arr0:
+            if mode == "filter" and gsig < 0:
+                continue
+            if mode == "confidence":
+                p = p * (1.0 + 0.15 * q.clip_tanh(gsig, scale=1.5))
+            arr.append((tk, p, ex, gsig))
+        if not arr:
+            continue
+        arr = sorted(arr, key=lambda x: x[1], reverse=True)
         sel = arr[: min(topn, len(arr))]
         if not sel:
             continue
@@ -128,7 +154,7 @@ def evaluate(data, benchmark, horizon, topn, disabled_groups: Set[str], only_gro
         if prev_set:
             turn_sum += 1 - len(cur_set & prev_set) / max(1, len(cur_set | prev_set))
         prev_set = cur_set
-        for tk, _p, ex in sel:
+        for tk, _p, ex, _gsig in sel:
             if tk.endswith('.HK'):
                 h_contrib += ex
                 h_n += 1
@@ -168,18 +194,22 @@ def evaluate(data, benchmark, horizon, topn, disabled_groups: Set[str], only_gro
     neg = [x for x in rs if x <= 0]
     payoff = (sum(pos) / len(pos)) / abs(sum(neg) / len(neg)) if pos and neg and abs(sum(neg)) > 1e-12 else 0.0
 
+    info_ratio = sharpe
+    utility = ann - 0.50 * (turn_sum / max(1, len(rs) - 1)) - 0.30 * abs(mdd)
     return {
         'days': len(rs),
         'cum_excess_return': eq[-1] - 1.0,
         'annualized_excess_return': ann,
         'max_drawdown': mdd,
         'sharpe': sharpe,
+        'information_ratio': info_ratio,
         'calmar': calmar,
         'win_rate': len(pos) / len(rs),
         'payoff_ratio': payoff,
         'turnover': turn_sum / max(1, len(rs) - 1),
         'rankic': sum(daily_ic) / max(1, len(daily_ic)),
         'rankic_ir': (sum(daily_ic) / len(daily_ic)) / (math.sqrt(sum((x - (sum(daily_ic)/len(daily_ic)))**2 for x in daily_ic) / max(1, len(daily_ic)-1)) + 1e-12),
+        'utility_score': utility,
         'a_alpha': a_contrib / max(1, a_n),
         'h_alpha': h_contrib / max(1, h_n),
         'phase_alpha': {k: (sum(v) / len(v) if v else 0.0) for k, v in phase.items()},
@@ -212,6 +242,16 @@ def main():
         ablation[g] = evaluate(data, args.benchmark, args.horizon, args.topn, disabled_groups={g})
         standalone[g] = evaluate(data, args.benchmark, args.horizon, args.topn, disabled_groups=set(), only_groups={g})
 
+    placement = {}
+    for g in ["broker_revision", "sentiment_macro"]:
+        placement[g] = {
+            "direct": evaluate(data, args.benchmark, args.horizon, args.topn, disabled_groups=set(), mode="direct", focus_group=g),
+            "filter": evaluate(data, args.benchmark, args.horizon, args.topn, disabled_groups={g}, mode="filter", focus_group=g),
+            "confidence": evaluate(data, args.benchmark, args.horizon, args.topn, disabled_groups={g}, mode="confidence", focus_group=g),
+        }
+    # macro is included in sentiment_macro group above; keep explicit alias for readability
+    placement["global_macro"] = placement["sentiment_macro"]
+
     lines = []
     lines.append('# Quant System Structure Audit Report')
     lines.append('')
@@ -237,7 +277,7 @@ def main():
     lines.append('- 行业/市值中性化：当前无严格回归中性化（行业仅用于组合约束；市值代理尚弱）。')
     lines.append('- 回测假设：当前核心回测侧重超额收益方向与组合收益统计；交易成本/滑点/涨跌停实盘约束仍需进一步细化。')
     lines.append('')
-    lines.append('## 3) Key Metrics (baseline)')
+    lines.append('## 3) Key Metrics (baseline, primary = excess-return quality)')
     rows = [["metric", "value"]] + [[k, f"{v:.6f}" if isinstance(v, float) else json.dumps(v, ensure_ascii=False)] for k, v in baseline.items()]
     lines.append(md_table(rows))
     lines.append('')
@@ -248,46 +288,101 @@ def main():
     lines.append(md_table(inv))
     lines.append('')
     lines.append('## 5) Ablation (remove one group)')
-    rows = [["group", "cum_excess", "ann_excess", "max_dd", "sharpe", "turnover", "rankic"]]
+    rows = [["group", "cum_excess", "ann_excess", "max_dd", "IR", "turnover", "rankic", "utility"]]
     for g, m in ablation.items():
         if not m:
-            rows.append([g, 'NA', 'NA', 'NA', 'NA', 'NA', 'NA'])
+            rows.append([g, 'NA', 'NA', 'NA', 'NA', 'NA', 'NA', 'NA'])
             continue
         rows.append([
             g,
             f"{m['cum_excess_return']:.4f}",
             f"{m['annualized_excess_return']:.4f}",
             f"{m['max_drawdown']:.4f}",
-            f"{m['sharpe']:.4f}",
+            f"{m['information_ratio']:.4f}",
             f"{m['turnover']:.4f}",
             f"{m['rankic']:.4f}",
+            f"{m['utility_score']:.4f}",
         ])
     lines.append(md_table(rows))
     lines.append('')
     lines.append('## 6) Standalone Group Power')
-    rows = [["group", "cum_excess", "ann_excess", "max_dd", "sharpe", "turnover", "rankic"]]
+    rows = [["group", "cum_excess", "ann_excess", "max_dd", "IR", "turnover", "rankic", "utility"]]
     for g, m in standalone.items():
         if not m:
-            rows.append([g, 'NA', 'NA', 'NA', 'NA', 'NA', 'NA'])
+            rows.append([g, 'NA', 'NA', 'NA', 'NA', 'NA', 'NA', 'NA'])
             continue
         rows.append([
             g,
             f"{m['cum_excess_return']:.4f}",
             f"{m['annualized_excess_return']:.4f}",
             f"{m['max_drawdown']:.4f}",
-            f"{m['sharpe']:.4f}",
+            f"{m['information_ratio']:.4f}",
             f"{m['turnover']:.4f}",
             f"{m['rankic']:.4f}",
+            f"{m['utility_score']:.4f}",
         ])
     lines.append(md_table(rows))
     lines.append('')
-    lines.append('## 7) Most Likely Issues')
+    lines.append('## 7) Placement Test: direct vs filter vs confidence')
+    rows = [["group", "mode", "ann_excess", "IR", "max_dd", "turnover", "utility", "suggested_role"]]
+    for g, mp in placement.items():
+        best_mode = "direct"
+        best_u = -1e18
+        for mode, m in mp.items():
+            if not m:
+                continue
+            if m["utility_score"] > best_u:
+                best_u = m["utility_score"]
+                best_mode = mode
+        for mode, m in mp.items():
+            if not m:
+                continue
+            role = (
+                "core alpha" if mode == best_mode and mode == "direct" else
+                "regime signal" if mode == best_mode and mode == "filter" else
+                "confidence modifier" if mode == best_mode and mode == "confidence" else
+                "secondary"
+            )
+            rows.append([
+                g, mode,
+                f"{m['annualized_excess_return']:.4f}",
+                f"{m['information_ratio']:.4f}",
+                f"{m['max_drawdown']:.4f}",
+                f"{m['turnover']:.4f}",
+                f"{m['utility_score']:.4f}",
+                role,
+            ])
+    lines.append(md_table(rows))
+    lines.append('')
+
+    lines.append('## 8) Model Ranking by Excess-Return Quality (not hit-rate)')
+    comp = [
+        ("baseline", baseline),
+    ] + [(f"ablate_{k}", v) for k, v in ablation.items()] + [(f"standalone_{k}", v) for k, v in standalone.items()]
+    comp = [x for x in comp if x[1]]
+    comp.sort(key=lambda x: x[1]["utility_score"], reverse=True)
+    rows = [["model", "ann_excess", "IR", "max_dd", "turnover", "payoff", "win_rate", "utility"]]
+    for name, m in comp:
+        rows.append([
+            name,
+            f"{m['annualized_excess_return']:.4f}",
+            f"{m['information_ratio']:.4f}",
+            f"{m['max_drawdown']:.4f}",
+            f"{m['turnover']:.4f}",
+            f"{m['payoff_ratio']:.4f}",
+            f"{m['win_rate']:.4f}",
+            f"{m['utility_score']:.4f}",
+        ])
+    lines.append(md_table(rows))
+    lines.append('')
+
+    lines.append('## 9) Most Likely Issues')
     lines.append('- 目标函数仍容易被“命中率”牵引，成本后信息比率优化不足。')
     lines.append('- 市值/行业严格中性化缺失，风格漂移风险仍在。')
     lines.append('- 成本、滑点、不可交易（停牌/涨跌停）的实盘约束尚需全量并入回测成交层。')
     lines.append('- 外资/情绪/宏观三组的角色边界（核心 alpha vs 过滤器）还需通过年度稳定性进一步约束。')
     lines.append('')
-    lines.append('## 8) Highest ROI Improvements')
+    lines.append('## 10) Highest ROI Improvements')
     lines.append('1. 先用“年化超额 + IR - 换手惩罚”做主排序指标。')
     lines.append('2. 将外资/情绪/宏观从直接排序因子迁移为 regime/filter/confidence 层。')
     lines.append('3. 在组合层补齐小市值上限与低流动性硬过滤。')

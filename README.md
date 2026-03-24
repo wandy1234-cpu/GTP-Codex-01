@@ -263,6 +263,8 @@ python audit_quant_system.py --output-md audit_report.md
 - baseline 指标（含超额收益、回撤、Sharpe、Calmar、换手、RankIC）
 - 因子组 ablation（删一组）对比
 - 因子组 standalone（单组）效果
+- 外资/情绪/宏观三组 placement 对比（direct / filter / confidence）
+- 模型按“超额收益质量”（非命中率）排序对比
 - most likely issues / highest ROI improvements
 - 保留时间切分 + Logistic SGD + F1 阈值搜索 + TopN 概率排序
 

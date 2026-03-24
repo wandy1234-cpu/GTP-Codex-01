@@ -248,6 +248,22 @@ http://127.0.0.1:8000
 - 新增组合约束式三层池输出（正式池/替补池/观察池）
 - 新增退出规则参数（固定止损、移动止盈、持有上限、信号失效 rank）
 - 新增日报导出（JSON + Markdown）
+
+## 6.1) 结构审计与因子删减诊断（建议先做）
+
+新增 `audit_quant_system.py`，用于对现有系统做“先审计再优化”的诊断，不直接改模型：
+
+```bash
+python audit_quant_system.py --output-md audit_report.md
+```
+
+报告会输出：
+- pipeline diagram
+- 因子分组清单（inventory）
+- baseline 指标（含超额收益、回撤、Sharpe、Calmar、换手、RankIC）
+- 因子组 ablation（删一组）对比
+- 因子组 standalone（单组）效果
+- most likely issues / highest ROI improvements
 - 保留时间切分 + Logistic SGD + F1 阈值搜索 + TopN 概率排序
 
 ## 7) 偏 Alpha 下一步建议

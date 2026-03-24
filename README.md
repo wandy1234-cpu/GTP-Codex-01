@@ -264,6 +264,8 @@ python audit_quant_system.py --output-md audit_report.md
 - 因子组 ablation（删一组）对比
 - 因子组 standalone（单组）效果
 - 外资/情绪/宏观三组 placement 对比（direct / filter / confidence）
+- 组合层约束前后对比（constrained vs unconstrained）
+- regime overlay 前后对比（original vs +overlay）
 - 模型按“超额收益质量”（非命中率）排序对比
 - most likely issues / highest ROI improvements
 - 保留时间切分 + Logistic SGD + F1 阈值搜索 + TopN 概率排序

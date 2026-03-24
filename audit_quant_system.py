@@ -78,6 +78,8 @@ def evaluate(
     only_groups: Set[str] | None = None,
     mode: str = "direct",
     focus_group: str | None = None,
+    use_constraints: bool = False,
+    use_regime_overlay: bool = False,
 ):
     mkt = q.build_market_sentiment_map(data, benchmark)
     macro = {}
@@ -125,6 +127,8 @@ def evaluate(
     h_contrib = 0.0
     a_n = h_n = 0
     phase = defaultdict(list)
+    concentration_sum = 0.0
+    conc_days = 0
 
     bm_rows = data.get(benchmark, [])
     bm_close = {r.date: r.close for r in bm_rows}
@@ -144,7 +148,61 @@ def evaluate(
         if not arr:
             continue
         arr = sorted(arr, key=lambda x: x[1], reverse=True)
-        sel = arr[: min(topn, len(arr))]
+
+        # regime overlay: adjust recommendation count
+        target_n = min(topn, len(arr))
+        if use_regime_overlay:
+            idx = next((i for i, bd in enumerate(bm_dates) if bd == d), -1)
+            if idx >= 60:
+                ma20 = sum(bm_close[bm_dates[j]] for j in range(idx - 19, idx + 1)) / 20
+                ma60 = sum(bm_close[bm_dates[j]] for j in range(idx - 59, idx + 1)) / 60
+                if bm_close[d] > ma20 and bm_close[d] > ma60:
+                    target_n = min(target_n, 10)
+                elif bm_close[d] < ma20 and bm_close[d] < ma60:
+                    target_n = min(target_n, 3)
+                else:
+                    target_n = min(target_n, 6)
+
+        # confidence filter: weak dispersion -> reduce names
+        if len(arr) >= 6:
+            top_probs = [x[1] for x in arr[: min(10, len(arr))]]
+            meanp = sum(top_probs) / len(top_probs)
+            stdp = math.sqrt(sum((x - meanp) ** 2 for x in top_probs) / max(1, len(top_probs) - 1))
+            if stdp < 0.025:
+                target_n = min(target_n, 6)
+
+        if use_constraints:
+            picked = []
+            sec_cnt = defaultdict(int)
+            high_vol_cnt = 0
+            small_cap_cnt = 0
+            for tk, p, ex, gsig in arr:
+                xraw = next((x for s, pp, x in zip(test, probs, x_test) if s.ticker == tk and abs(pp - p) < 1e-12), None)
+                vol_z = xraw[q.FEATURE_NAMES.index("vol_20d")] if xraw is not None and "vol_20d" in q.FEATURE_NAMES else 0.0
+                amihud_z = xraw[q.FEATURE_NAMES.index("amihud_20d")] if xraw is not None and "amihud_20d" in q.FEATURE_NAMES else 0.0
+                is_high_vol = vol_z > 0.8
+                is_smallcap_proxy = amihud_z > 0.6
+                is_low_liq = amihud_z > (1.1 if tk.endswith('.HK') else 1.3)
+                sec = q.infer_sector(tk)
+                if is_low_liq:
+                    continue
+                if sec_cnt[sec] >= 2:
+                    continue
+                if is_high_vol and high_vol_cnt >= 3:
+                    continue
+                if is_smallcap_proxy and small_cap_cnt >= 3:
+                    continue
+                picked.append((tk, p, ex, gsig))
+                sec_cnt[sec] += 1
+                if is_high_vol:
+                    high_vol_cnt += 1
+                if is_smallcap_proxy:
+                    small_cap_cnt += 1
+                if len(picked) >= target_n:
+                    break
+            sel = picked
+        else:
+            sel = arr[: target_n]
         if not sel:
             continue
         ret = sum(x[2] for x in sel) / len(sel)
@@ -154,6 +212,12 @@ def evaluate(
         if prev_set:
             turn_sum += 1 - len(cur_set & prev_set) / max(1, len(cur_set | prev_set))
         prev_set = cur_set
+        sec_count = defaultdict(int)
+        for tk in cur_set:
+            sec_count[q.infer_sector(tk)] += 1
+        hhi = sum((c / max(1, len(cur_set))) ** 2 for c in sec_count.values())
+        concentration_sum += hhi
+        conc_days += 1
         for tk, _p, ex, _gsig in sel:
             if tk.endswith('.HK'):
                 h_contrib += ex
@@ -195,7 +259,8 @@ def evaluate(
     payoff = (sum(pos) / len(pos)) / abs(sum(neg) / len(neg)) if pos and neg and abs(sum(neg)) > 1e-12 else 0.0
 
     info_ratio = sharpe
-    utility = ann - 0.50 * (turn_sum / max(1, len(rs) - 1)) - 0.30 * abs(mdd)
+    turnover = turn_sum / max(1, len(rs) - 1)
+    utility = ann - 0.50 * turnover - 0.30 * abs(mdd)
     return {
         'days': len(rs),
         'cum_excess_return': eq[-1] - 1.0,
@@ -206,7 +271,8 @@ def evaluate(
         'calmar': calmar,
         'win_rate': len(pos) / len(rs),
         'payoff_ratio': payoff,
-        'turnover': turn_sum / max(1, len(rs) - 1),
+        'turnover': turnover,
+        'concentration_hhi': concentration_sum / max(1, conc_days),
         'rankic': sum(daily_ic) / max(1, len(daily_ic)),
         'rankic_ir': (sum(daily_ic) / len(daily_ic)) / (math.sqrt(sum((x - (sum(daily_ic)/len(daily_ic)))**2 for x in daily_ic) / max(1, len(daily_ic)-1)) + 1e-12),
         'utility_score': utility,
@@ -234,20 +300,20 @@ def main():
     args = ap.parse_args()
 
     data = q.generate_demo_data(seed=42)
-    baseline = evaluate(data, args.benchmark, args.horizon, args.topn, disabled_groups=set())
+    baseline = evaluate(data, args.benchmark, args.horizon, args.topn, disabled_groups=set(), use_constraints=False, use_regime_overlay=False)
 
     ablation = {}
     standalone = {}
     for g in GROUPS:
-        ablation[g] = evaluate(data, args.benchmark, args.horizon, args.topn, disabled_groups={g})
-        standalone[g] = evaluate(data, args.benchmark, args.horizon, args.topn, disabled_groups=set(), only_groups={g})
+        ablation[g] = evaluate(data, args.benchmark, args.horizon, args.topn, disabled_groups={g}, use_constraints=False, use_regime_overlay=False)
+        standalone[g] = evaluate(data, args.benchmark, args.horizon, args.topn, disabled_groups=set(), only_groups={g}, use_constraints=False, use_regime_overlay=False)
 
     placement = {}
     for g in ["broker_revision", "sentiment_macro"]:
         placement[g] = {
-            "direct": evaluate(data, args.benchmark, args.horizon, args.topn, disabled_groups=set(), mode="direct", focus_group=g),
-            "filter": evaluate(data, args.benchmark, args.horizon, args.topn, disabled_groups={g}, mode="filter", focus_group=g),
-            "confidence": evaluate(data, args.benchmark, args.horizon, args.topn, disabled_groups={g}, mode="confidence", focus_group=g),
+            "direct": evaluate(data, args.benchmark, args.horizon, args.topn, disabled_groups=set(), mode="direct", focus_group=g, use_constraints=False, use_regime_overlay=False),
+            "filter": evaluate(data, args.benchmark, args.horizon, args.topn, disabled_groups={g}, mode="filter", focus_group=g, use_constraints=False, use_regime_overlay=False),
+            "confidence": evaluate(data, args.benchmark, args.horizon, args.topn, disabled_groups={g}, mode="confidence", focus_group=g, use_constraints=False, use_regime_overlay=False),
         }
     # macro is included in sentiment_macro group above; keep explicit alias for readability
     placement["global_macro"] = placement["sentiment_macro"]
@@ -281,6 +347,8 @@ def main():
     rows = [["metric", "value"]] + [[k, f"{v:.6f}" if isinstance(v, float) else json.dumps(v, ensure_ascii=False)] for k, v in baseline.items()]
     lines.append(md_table(rows))
     lines.append('')
+
+    # keep section order: first inventory/ablation/standalone/placement, then layer impact sections
     lines.append('## 4) Factor Inventory')
     inv = [["group", "factors"]]
     for g, fs in GROUPS.items():
@@ -352,6 +420,42 @@ def main():
                 f"{m['utility_score']:.4f}",
                 role,
             ])
+    lines.append(md_table(rows))
+    lines.append('')
+
+    lines.append('## 7.5) Portfolio Layer Impact (constrained vs unconstrained)')
+    pc_base = evaluate(data, args.benchmark, args.horizon, args.topn, disabled_groups=set(), use_constraints=False, use_regime_overlay=False)
+    pc_con = evaluate(data, args.benchmark, args.horizon, args.topn, disabled_groups=set(), use_constraints=True, use_regime_overlay=False)
+    rows = [["setting", "ann_excess", "IR", "max_dd", "turnover", "concentration_hhi", "utility"]]
+    for name, m in [("unconstrained", pc_base), ("constrained", pc_con)]:
+        rows.append([
+            name,
+            f"{m['annualized_excess_return']:.4f}",
+            f"{m['information_ratio']:.4f}",
+            f"{m['max_drawdown']:.4f}",
+            f"{m['turnover']:.4f}",
+            f"{m['concentration_hhi']:.4f}",
+            f"{m['utility_score']:.4f}",
+        ])
+    lines.append(md_table(rows))
+    lines.append('')
+
+    lines.append('## 7.6) Regime Overlay Impact (old model intact + overlay)')
+    ov_base = evaluate(data, args.benchmark, args.horizon, args.topn, disabled_groups=set(), use_constraints=False, use_regime_overlay=False)
+    ov_reg = evaluate(data, args.benchmark, args.horizon, args.topn, disabled_groups=set(), use_constraints=False, use_regime_overlay=True)
+    ov_full = evaluate(data, args.benchmark, args.horizon, args.topn, disabled_groups=set(), use_constraints=True, use_regime_overlay=True)
+    rows = [["setting", "ann_excess", "IR", "max_dd", "turnover", "win_rate", "utility", "phase_alpha"]]
+    for name, m in [("original", ov_base), ("+regime_overlay", ov_reg), ("+regime+constraints", ov_full)]:
+        rows.append([
+            name,
+            f"{m['annualized_excess_return']:.4f}",
+            f"{m['information_ratio']:.4f}",
+            f"{m['max_drawdown']:.4f}",
+            f"{m['turnover']:.4f}",
+            f"{m['win_rate']:.4f}",
+            f"{m['utility_score']:.4f}",
+            json.dumps(m.get('phase_alpha', {}), ensure_ascii=False),
+        ])
     lines.append(md_table(rows))
     lines.append('')
 

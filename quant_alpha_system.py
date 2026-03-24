@@ -19,6 +19,14 @@ from urllib.request import Request, urlopen
 
 NETWORK_TIMEOUT_SECONDS = 12
 NETWORK_RETRIES = 2
+OFFLINE_ENV_KEYS = [
+    "ALPHA_DISABLE_NETWORK",
+    "NO_NETWORK",
+    "OFFLINE",
+    "HF_HUB_OFFLINE",
+    "TRANSFORMERS_OFFLINE",
+    "PIP_NO_INDEX",
+]
 
 
 @dataclass
@@ -160,6 +168,24 @@ def load_institutional_factor_csv(path: str) -> Dict[str, List[Tuple[dt.date, fl
     for tk in out:
         out[tk].sort(key=lambda x: x[0])
     return out
+
+
+def apply_network_env_patch(force_enable: bool = True) -> List[str]:
+    """
+    尝试解除常见“离线模式”环境变量，避免误配置导致联网失败。
+    返回被修改的环境变量名列表。
+    """
+    changed: List[str] = []
+    if not force_enable:
+        return changed
+    for k in OFFLINE_ENV_KEYS:
+        if k in os.environ:
+            os.environ.pop(k, None)
+            changed.append(k)
+    if os.environ.get("NO_PROXY", "") == "*":
+        os.environ["NO_PROXY"] = ""
+        changed.append("NO_PROXY")
+    return changed
 
 
 def get_institutional_score(
@@ -1735,6 +1761,19 @@ def main():
     parser.add_argument("--wf-step-days", type=int, default=21, help="Walk-forward step size (trading days)")
     parser.add_argument("--walk-forward-csv", type=str, default="", help="Output CSV for walk-forward daily win-rate report")
     parser.add_argument("--db-path", type=str, default="alpha_realtime.db", help="SQLite path for realtime/history cache")
+    parser.set_defaults(force_network_env=True)
+    parser.add_argument(
+        "--force-network-env",
+        dest="force_network_env",
+        action="store_true",
+        help="Try to clear common offline env flags (default ON).",
+    )
+    parser.add_argument(
+        "--no-force-network-env",
+        dest="force_network_env",
+        action="store_false",
+        help="Do not modify offline-related env variables.",
+    )
     parser.set_defaults(db_only=False)
     parser.add_argument("--db-only", dest="db_only", action="store_true", help="Run using local realtime database only")
     parser.add_argument("--no-db-only", dest="db_only", action="store_false", help="Allow network fetch/refresh (default)")
@@ -1781,6 +1820,9 @@ def main():
         help="Coverage ratio used by common-date alignment (0~1).",
     )
     args = parser.parse_args()
+    changed_envs = apply_network_env_patch(force_enable=args.force_network_env)
+    if changed_envs:
+        print(f"[INFO] Cleared offline env flags: {', '.join(changed_envs)}")
 
     global NETWORK_TIMEOUT_SECONDS, NETWORK_RETRIES
     NETWORK_TIMEOUT_SECONDS = max(3, int(args.request_timeout))

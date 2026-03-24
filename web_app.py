@@ -11,7 +11,7 @@ from urllib.parse import urlparse
 
 HOST = "127.0.0.1"
 PORT = 8000
-STRATEGY_TIMEOUT_SECONDS = 240
+STRATEGY_TIMEOUT_SECONDS = 480
 
 PAGE = """<!doctype html>
 <html lang="zh-CN">
@@ -157,8 +157,8 @@ PAGE = """<!doctype html>
       <div>
         <label>Walk-forward 回测</label>
         <select id="walk_forward">
-          <option value="1">开启（推荐）</option>
-          <option value="0">关闭</option>
+          <option value="0">关闭（默认，先确保快速出结果）</option>
+          <option value="1">开启（更慢）</option>
         </select>
       </div>
       <div>
@@ -224,11 +224,11 @@ async function run() {
 
   runBtn.disabled = true;
   runBtn.textContent = '运行中...';
-  document.getElementById('out').textContent = '运行中（请稍候，策略可能需要几十秒）...';
+  document.getElementById('out').textContent = '运行中（默认约 10~40 秒；开启 Walk-forward 会明显更慢）...';
   document.getElementById('wf_export_status').textContent = '';
   try {
     const ctl = new AbortController();
-    const timer = setTimeout(() => ctl.abort(), 260000);
+    const timer = setTimeout(() => ctl.abort(), 500000);
     const res = await fetch('/run', {
       method: 'POST',
       body: JSON.stringify(payload),
@@ -523,7 +523,7 @@ class Handler(BaseHTTPRequestHandler):
         use_institution_factor = str(payload.get("use_institution_factor", "1"))
         use_market_sentiment = str(payload.get("use_market_sentiment", "1"))
         use_global_macro = str(payload.get("use_global_macro", "1"))
-        walk_forward = str(payload.get("walk_forward", "1"))
+        walk_forward = str(payload.get("walk_forward", "0"))
         wf_train_days = str(payload.get("wf_train_days", "756"))
         wf_test_days = str(payload.get("wf_test_days", "21"))
         wf_step_days = str(payload.get("wf_step_days", "21"))
@@ -624,7 +624,12 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json({"output": output, "returncode": p.returncode, "wf_report": wf_report})
         except subprocess.TimeoutExpired:
             self._send_json(
-                {"error": f"运行超时（{STRATEGY_TIMEOUT_SECONDS}秒）: 请缩小股票池、降低重试次数，或改用 DB Only。"},
+                {
+                    "error": (
+                        f"运行超时（{STRATEGY_TIMEOUT_SECONDS}秒）: "
+                        "请先关闭 Walk-forward 再运行主结果；若是 live 模式再尝试降低股票池/重试次数或改用 DB Only。"
+                    )
+                },
                 500,
             )
         finally:

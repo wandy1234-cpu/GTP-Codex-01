@@ -1567,6 +1567,74 @@ def holdout_top20_winrate(test: List[Sample], probs: List[float], y_true: List[i
     return (total_win / total_sel) if total_sel else 0.0
 
 
+def compute_selection_objective(
+    samples: List[Sample],
+    scores: List[float],
+    top_frac: float = 0.2,
+    strong_up_threshold: float = 0.03,
+) -> Dict[str, float]:
+    """
+    Multi-objective score for ranking quality on out-of-sample data.
+    Primary: avg excess return + strong-up hit rate + stability
+    Secondary: keep win-rate as auxiliary metric.
+    """
+    by_day: Dict[dt.date, List[Tuple[float, Sample]]] = defaultdict(list)
+    for s, sc in zip(samples, scores):
+        by_day[s.date].append((sc, s))
+    daily_excess: List[float] = []
+    strong_hits = 0
+    up_hits = 0
+    total_sel = 0
+    for d in sorted(by_day.keys()):
+        arr = sorted(by_day[d], key=lambda x: x[0], reverse=True)
+        n = max(1, int(len(arr) * top_frac))
+        sel = arr[:n]
+        ex = [s.future_excess_ret for _sc, s in sel]
+        rt = [s.future_ret for _sc, s in sel]
+        daily_excess.append(sum(ex) / max(len(ex), 1))
+        strong_hits += sum(1 for r in rt if r >= strong_up_threshold)
+        up_hits += sum(1 for r in rt if r > 0)
+        total_sel += len(sel)
+    if not daily_excess:
+        return {
+            "avg_excess": 0.0,
+            "strong_hit": 0.0,
+            "win_rate": 0.0,
+            "stability": 0.0,
+            "vol_penalty": 0.0,
+            "drawdown_penalty": 0.0,
+            "objective": -1e9,
+        }
+    avg_excess = sum(daily_excess) / len(daily_excess)
+    strong_hit = strong_hits / max(total_sel, 1)
+    win_rate = up_hits / max(total_sel, 1)
+    mu, sd = mean_std(daily_excess)
+    nav = 1.0
+    peak = 1.0
+    max_dd = 0.0
+    for x in daily_excess:
+        nav *= (1.0 + x)
+        peak = max(peak, nav)
+        max_dd = min(max_dd, nav / peak - 1.0)
+    stability = 1.0 / (1.0 + sd * 12.0)
+    objective = (
+        1.00 * avg_excess
+        + 0.35 * strong_hit
+        + 0.25 * stability
+        - 0.20 * sd
+        - 0.15 * abs(max_dd)
+    )
+    return {
+        "avg_excess": avg_excess,
+        "strong_hit": strong_hit,
+        "win_rate": win_rate,
+        "stability": stability,
+        "vol_penalty": sd,
+        "drawdown_penalty": abs(max_dd),
+        "objective": objective,
+    }
+
+
 def rank_latest(
     samples: List[Sample],
     w: List[float],
@@ -2005,34 +2073,30 @@ def write_walk_forward_report(
 
 def auto_tune_horizon_weights(
     horizons: List[int],
-    per_horizon_test: Dict[int, List[Tuple[dt.date, str, float, int]]],
+    per_horizon_eval: Dict[int, List[Tuple[dt.date, str, float, float, float]]],
+    strong_up_threshold: float = 0.03,
 ) -> List[float]:
     """
-    根据每个周期在测试集上 top20% 的胜率自动分配融合权重。
-    权重分数 = max(win_rate - 0.5, 0.0001) * log(1 + selected_count)
+    根据每个周期在测试集上的综合目标自动分配融合权重：
+    - TopN 平均超额收益
+    - 大涨命中率
+    - 稳定性（波动/回撤惩罚）
+    仍保留 win_rate 作为辅助观测，不作为主目标。
     """
     scores: List[float] = []
     for h in horizons:
-        recs = per_horizon_test.get(h, [])
+        recs = per_horizon_eval.get(h, [])
         if not recs:
             scores.append(0.0)
             continue
-        by_day: Dict[dt.date, List[Tuple[float, int]]] = defaultdict(list)
-        for d, _tk, p, y in recs:
-            by_day[d].append((p, y))
-        total_sel = 0
-        total_win = 0
-        for d in by_day:
-            arr = sorted(by_day[d], key=lambda x: x[0], reverse=True)
-            n = max(1, int(len(arr) * 0.2))
-            sel = arr[:n]
-            wins = sum(1 for _p, y in sel if y == 1)
-            total_sel += n
-            total_win += wins
-        wr = (total_win / total_sel) if total_sel else 0.0
-        edge = max(wr - 0.5, 0.0001)
-        score = edge * math.log1p(total_sel)
-        scores.append(score)
+        pseudo_samples = [
+            Sample(date=d, ticker=tk, features=[0.0], target=1 if fr > 0 else 0, close=0.0, future_ret=fr, future_excess_ret=fex)
+            for d, tk, sc, fr, fex in recs
+        ]
+        scs = [sc for _d, _tk, sc, _fr, _fex in recs]
+        met = compute_selection_objective(pseudo_samples, scs, top_frac=0.2, strong_up_threshold=strong_up_threshold)
+        score = max(met["objective"], -1.0)
+        scores.append(score + 1.0001)
     return normalize_weights(scores, len(horizons))
 
 
@@ -2214,6 +2278,9 @@ def main():
     parser.add_argument("--risk-w-down", type=float, default=0.35)
     parser.add_argument("--risk-w-vol", type=float, default=0.25)
     parser.add_argument("--risk-w-dd", type=float, default=0.20)
+    parser.add_argument("--debug-no-risk-penalty", action="store_true", help="Debug: disable ranking-layer risk penalty terms")
+    parser.add_argument("--debug-no-barra", action="store_true", help="Debug: disable BARRA risk penalty in portfolio builder")
+    parser.add_argument("--debug-no-cost", action="store_true", help="Debug: disable turnover cost penalty in portfolio builder")
     parser.set_defaults(barra_risk_control=True)
     parser.add_argument(
         "--barra-risk-control",
@@ -2322,6 +2389,11 @@ def main():
     global NETWORK_TIMEOUT_SECONDS, NETWORK_RETRIES
     NETWORK_TIMEOUT_SECONDS = max(3, int(args.request_timeout))
     NETWORK_RETRIES = max(1, int(args.request_retries))
+    if args.debug_no_barra:
+        args.barra_risk_control = False
+        args.barra_risk_aversion = 0.0
+    if args.debug_no_cost:
+        args.cost_penalty = 0.0
 
     latest_quote: Dict[str, Tuple[float, dt.datetime]] = {}
     runtime_names: Dict[str, str] = {}
@@ -2466,6 +2538,7 @@ def main():
     per_horizon_contrib_maps: Dict[int, Dict[str, List[float]]] = {}
     per_horizon_feature_scalers: Dict[int, List[float]] = {}
     per_horizon_test: Dict[int, List[Tuple[dt.date, str, float, int]]] = {}
+    per_horizon_eval: Dict[int, List[Tuple[dt.date, str, float, float, float]]] = {}
     metrics_rows: List[Tuple[int, int, int, float, float, float, float]] = []
     latest_dates: List[dt.date] = []
     latest_bar_by_ticker: Dict[str, Row] = {tk: rows[-1] for tk, rows in data.items() if rows}
@@ -2516,6 +2589,7 @@ def main():
         t_base = best_threshold(y_test, probs_base)
         m_base = compute_metrics(y_test, probs_base, threshold=t_base)
         wr_base = holdout_top20_winrate(test, pred_ex_base, y_test)
+        obj_base = compute_selection_objective(test, pred_ex_base, top_frac=0.2, strong_up_threshold=args.strong_up_threshold)
 
         scalers = base_scalers
         model_obj = model_base
@@ -2549,7 +2623,10 @@ def main():
             t_t = best_threshold(y_test, probs_t)
             m_t = compute_metrics(y_test, probs_t, threshold=t_t)
             wr_t = holdout_top20_winrate(test, pred_ex_t, y_test)
-            if (wr_t > wr_base) or (wr_t == wr_base and m_t.auc >= m_base.auc):
+            obj_t = compute_selection_objective(test, pred_ex_t, top_frac=0.2, strong_up_threshold=args.strong_up_threshold)
+            if (obj_t["objective"] > obj_base["objective"]) or (
+                obj_t["objective"] == obj_base["objective"] and (wr_t > wr_base or m_t.auc >= m_base.auc)
+            ):
                 scalers = cand_scalers
                 model_obj = model_t
                 model_strong = model_strong_t
@@ -2565,8 +2642,10 @@ def main():
                 pred_rel = pred_rel_t
                 t = t_t
                 m = m_t
+                obj_base = obj_t
         metrics_rows.append((h, len(train), len(test), t, m.accuracy, m.precision, m.auc))
         per_horizon_test[h] = [(row.date, row.ticker, pp, yy) for row, pp, yy in zip(test, probs, y_test)]
+        per_horizon_eval[h] = [(row.date, row.ticker, sc, row.future_ret, row.future_excess_ret) for row, sc in zip(test, pred_ex)]
         per_horizon_feature_scalers[h] = scalers
 
         latest_date = max(s.date for s in samples_h)
@@ -2635,6 +2714,8 @@ def main():
                 + args.risk_w_vol * zscore(risk20, vol_mu, vol_sd)
                 + args.risk_w_dd * zscore(drawdown20, dd_mu, dd_sd)
             )
+            if args.debug_no_risk_penalty:
+                risk_penalty = 0.0
             final_score = gain_score - risk_penalty
             mapp[s.ticker] = (s.close, final_score, risk20, src)
             detail_map[s.ticker] = {
@@ -2644,7 +2725,11 @@ def main():
                 "pred_excess_ret_5d": r_ex,
                 "downside_risk": p_down,
                 "rank_score": r_rank,
+                "gain_score": gain_score,
+                "risk_penalty": risk_penalty,
                 "final_score": final_score,
+                "realized_future_ret_5d": s.future_ret,
+                "realized_future_excess_ret_5d": s.future_excess_ret,
             }
             cmap[s.ticker] = contrib
         per_horizon_maps[h] = mapp
@@ -2674,6 +2759,7 @@ def main():
                 t_base = best_threshold(y_test, probs_base)
                 m_base = compute_metrics(y_test, probs_base, threshold=t_base)
                 wr_base = holdout_top20_winrate(test, probs_base, y_test)
+                obj_base = compute_selection_objective(test, probs_base, top_frac=0.2, strong_up_threshold=args.strong_up_threshold)
 
                 scalers = base_scalers
                 model_obj = model_base
@@ -2688,14 +2774,19 @@ def main():
                     t_t = best_threshold(y_test, probs_t)
                     m_t = compute_metrics(y_test, probs_t, threshold=t_t)
                     wr_t = holdout_top20_winrate(test, probs_t, y_test)
-                    if (wr_t > wr_base) or (wr_t == wr_base and m_t.auc >= m_base.auc):
+                    obj_t = compute_selection_objective(test, probs_t, top_frac=0.2, strong_up_threshold=args.strong_up_threshold)
+                    if (obj_t["objective"] > obj_base["objective"]) or (
+                        obj_t["objective"] == obj_base["objective"] and (wr_t > wr_base or m_t.auc >= m_base.auc)
+                    ):
                         scalers = cand_scalers
                         model_obj = model_t
                         probs = probs_t
                         t = t_t
                         m = m_t
+                        obj_base = obj_t
                 metrics_rows.append((h, len(train), len(test), t, m.accuracy, m.precision, m.auc))
                 per_horizon_test[h] = [(row.date, row.ticker, pp, yy) for row, pp, yy in zip(test, probs, y_test)]
+                per_horizon_eval[h] = [(row.date, row.ticker, pp, row.future_ret, row.future_excess_ret) for row, pp in zip(test, probs)]
                 per_horizon_feature_scalers[h] = scalers
                 latest_date = max(s.date for s in samples_h)
                 latest_dates.append(latest_date)
@@ -2732,7 +2823,7 @@ def main():
         tickers_union.update(mp.keys())
 
     if args.auto_tune_horizon_weights:
-        h_weights = auto_tune_horizon_weights(horizons, per_horizon_test)
+        h_weights = auto_tune_horizon_weights(horizons, per_horizon_eval, strong_up_threshold=args.strong_up_threshold)
     horizon_weight_map = {h: h_weights[i] for i, h in enumerate(horizons)}
     ranked_all: List[Tuple[str, float, float, float, str, List[float]]] = []
     ranked_detail: Dict[str, Dict[str, float]] = {}
@@ -2748,7 +2839,11 @@ def main():
             "pred_excess_ret_5d": 0.0,
             "downside_risk": 0.0,
             "rank_score": 0.0,
+            "gain_score": 0.0,
+            "risk_penalty": 0.0,
             "final_score": 0.0,
+            "realized_future_ret_5d": 0.0,
+            "realized_future_excess_ret_5d": 0.0,
         }
         for h in sorted(per_horizon_maps.keys(), reverse=True):
             mp = per_horizon_maps[h]
@@ -2795,6 +2890,31 @@ def main():
         max_per_sector=max(1, args.sector_max_holdings),
         max_high_risk=max(1, args.high_risk_max_holdings),
     )
+    # Old-vs-New A/B compare on same model_date + same pool:
+    # old: up_prob ranking, new: final_score ranking.
+    old_ranked_all = sorted(
+        ranked_all,
+        key=lambda x: ranked_detail.get(x[0], {}).get("prob_up_5d", x[2]),
+        reverse=True,
+    )
+    old_top10 = [tk for tk, *_ in old_ranked_all[:10]]
+    new_top10 = [tk for tk, *_ in ranked_all[:10]]
+    overlap = len(set(old_top10) & set(new_top10))
+    overlap_ratio = overlap / max(1, min(len(old_top10), len(new_top10)))
+
+    def _top_metrics(tickers: List[str]) -> Dict[str, float]:
+        if not tickers:
+            return {"avg_excess": 0.0, "strong_hit": 0.0, "avg_ret": 0.0}
+        ex = [ranked_detail.get(tk, {}).get("realized_future_excess_ret_5d", 0.0) for tk in tickers]
+        rt = [ranked_detail.get(tk, {}).get("realized_future_ret_5d", 0.0) for tk in tickers]
+        return {
+            "avg_excess": sum(ex) / len(ex),
+            "strong_hit": sum(1 for r in rt if r >= args.strong_up_threshold) / len(rt),
+            "avg_ret": sum(rt) / len(rt),
+        }
+
+    ab_old = _top_metrics(old_top10)
+    ab_new = _top_metrics(new_top10)
     while len(top) < max(1, final_n):
         top.append((f"N/A_{len(top)+1}", 0.0, 0.0, 0.0, "insufficient_universe", [0.0 for _ in FEATURE_NAMES]))
     report_model_date = latest_date
@@ -2885,6 +3005,39 @@ def main():
         if scalers:
             pairs = sorted(list(zip(FEATURE_NAMES, scalers)), key=lambda x: abs(x[1] - 1.0), reverse=True)[:3]
             print("      feature_weights(top3): " + ", ".join([f"{n}:{v:.2f}" for n, v in pairs]))
+    # primary objective diagnostics
+    eval_rows = per_horizon_eval.get(horizons[0], []) if horizons else []
+    if eval_rows:
+        pseudo = [
+            Sample(date=d, ticker=tk, features=[0.0], target=1 if fr > 0 else 0, close=0.0, future_ret=fr, future_excess_ret=fex)
+            for d, tk, sc, fr, fex in eval_rows
+        ]
+        scs = [sc for _d, _tk, sc, _fr, _fex in eval_rows]
+        met = compute_selection_objective(pseudo, scs, strong_up_threshold=args.strong_up_threshold)
+        print(
+            f"PrimaryObjective: composite={met['objective']:+.4f} | avg_excess={met['avg_excess']:+.4f} | "
+            f"strong_hit={met['strong_hit']:.4f} | stability={met['stability']:.4f} | "
+            f"aux_win_rate={met['win_rate']:.4f}"
+        )
+    print("RankingKey(default): final_score (old baseline key: up_prob)")
+    print("PortfolioWeightDriver: final_score + risk_penalty + barra + cost_penalty")
+    up_dist = [ranked_detail.get(tk, {}).get("prob_up_5d", 0.0) for tk, *_ in ranked_all]
+    fs_dist = [ranked_detail.get(tk, {}).get("final_score", 0.0) for tk, *_ in ranked_all]
+    if up_dist and fs_dist:
+        up_mu, _ = mean_std(up_dist)
+        fs_mu, _ = mean_std(fs_dist)
+        top_new = new_top10 if 'new_top10' in locals() else [tk for tk, *_ in ranked_all[:10]]
+        up_top_med = sorted([ranked_detail.get(tk, {}).get("prob_up_5d", 0.0) for tk in top_new])[len(top_new)//2] if top_new else 0.0
+        fs_top_med = sorted([ranked_detail.get(tk, {}).get("final_score", 0.0) for tk in top_new])[len(top_new)//2] if top_new else 0.0
+        print(
+            f"ScoreCompression: up_prob_pool_mean={up_mu:.4f}, final_score_pool_mean={fs_mu:.4f}, "
+            f"up_top10_med_gap={up_top_med-up_mu:+.4f}, final_top10_med_gap={fs_top_med-fs_mu:+.4f}"
+        )
+    print(
+        f"A/B Compare(old up_prob vs new final_score): overlap@10={overlap_ratio:.2%}, "
+        f"old_avg_excess={ab_old['avg_excess']:+.4f}, new_avg_excess={ab_new['avg_excess']:+.4f}, "
+        f"old_strong_hit={ab_old['strong_hit']:.4f}, new_strong_hit={ab_new['strong_hit']:.4f}"
+    )
     print("----------------------------------------------")
     print(f"TOP {len(top)} FORMAL POOL @ model_date={report_model_date.isoformat()}")
     factor_rows: List[Tuple[str, str, float]] = []
@@ -2897,6 +3050,8 @@ def main():
         pred_ret = det.get("pred_ret_5d", 0.0)
         pred_ex = det.get("pred_excess_ret_5d", 0.0)
         down_risk = det.get("downside_risk", 0.0)
+        gain_score = det.get("gain_score", 0.0)
+        risk_penalty = det.get("risk_penalty", 0.0)
         final_score = det.get("final_score", p)
         sub = factor_subscores_from_contrib(contrib)
         risk_tag = "HIGH_RISK" if risk20 > 0.045 else "MED_RISK" if risk20 > 0.03 else "LOW_RISK"
@@ -2906,7 +3061,8 @@ def main():
         )
         print(
             f"{'':26s} prob_strong_up_5d={prob_strong:.4f} pred_ret_5d={pred_ret:+.4f} "
-            f"pred_excess_ret_5d={pred_ex:+.4f} downside_risk={down_risk:.4f}"
+            f"pred_excess_ret_5d={pred_ex:+.4f} downside_risk={down_risk:.4f} "
+            f"gain_score={gain_score:+.4f} risk_penalty={risk_penalty:+.4f}"
         )
         print(
             f"{'':26s} score(total={sub['total_score']:+.3f}) "
@@ -2998,6 +3154,8 @@ def main():
                     "pred_ret_5d": round(ranked_detail.get(tk, {}).get("pred_ret_5d", 0.0), 6),
                     "pred_excess_ret_5d": round(ranked_detail.get(tk, {}).get("pred_excess_ret_5d", 0.0), 6),
                     "downside_risk": round(ranked_detail.get(tk, {}).get("downside_risk", 0.0), 6),
+                    "gain_score": round(ranked_detail.get(tk, {}).get("gain_score", 0.0), 6),
+                    "risk_penalty": round(ranked_detail.get(tk, {}).get("risk_penalty", 0.0), 6),
                     "final_score": round(ranked_detail.get(tk, {}).get("final_score", p), 6),
                     "risk20": round(risk20, 6),
                     "source": src,

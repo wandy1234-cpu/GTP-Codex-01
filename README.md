@@ -60,6 +60,8 @@ python quant_alpha_system.py
 - `--down-threshold -0.02`（下行风险标签阈值）
 - `--model-type mlp|logistic`（默认 `mlp`，logistic 作为纯 Python baseline 备选）
 - 评分权重参数：`--score-w-*` 与 `--risk-w-*`（收益-风险统一评分）
+- auto-tune 目标已从单一 win-rate 切换为综合目标（超额收益 + 大涨命中率 + 稳定性，并含波动/回撤惩罚）
+- `--debug-no-risk-penalty` / `--debug-no-barra` / `--debug-no-cost`（诊断模式：定位“alpha 被惩罚层抹平”问题）
 - `--auto-tune-horizon-weights`（根据 holdout 回测胜率自动反推多周期融合权重）
 - `--min-samples 500`（每个 horizon 最低样本门槛；ETF 模式默认自动放宽到 180）
 - `--report-csv one_year_report.csv`（导出近1年每日胜率报告）
@@ -86,6 +88,16 @@ python quant_alpha_system.py
 - **ETF 模式**：附加模式，参数应更保守（更高成本惩罚、更强流动性约束）。  
 - **纯 Python baseline**：`--model-type logistic`，用于稳态和对照。  
 - **增强模式**：`--model-type mlp`，在不破坏默认可运行前提下提升排序质量。
+
+## 1.2) 默认实盘排序逻辑（已切换）
+
+- 默认 TopN 排序键：`final_score`（不是 `up_prob`）。
+- 组合权重驱动：`final_score` 为主，叠加 `risk_aversion`、`barra_risk_aversion`、`cost_penalty`。
+- 终端会输出 old vs new A/B 诊断（`old up_prob` vs `new final_score`）：
+  - overlap@10
+  - TopN 平均 future_excess_ret_5d
+  - TopN 大涨命中率
+  - 分数压缩诊断（候选池分布 / Top10 与全池中位差距）
 
 ## 2) 指定数据窗口与股票池
 

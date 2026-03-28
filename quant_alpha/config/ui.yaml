@@ -1,0 +1,11 @@
+ui:
+  title: "Quant Alpha A/H Stock Picker"
+  theme: "dark"
+  refresh_seconds: 5
+  pages:
+    - dashboard
+    - today_picks
+    - backtest
+    - settings
+    - history
+    - data_health

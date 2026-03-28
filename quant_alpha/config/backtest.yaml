@@ -1,0 +1,25 @@
+walk_forward:
+  train_days: 252
+  test_days: 20
+  step_days: 20
+  purge_days: 5
+portfolio:
+  top_n: 10
+  holding_days: 5
+  mode: naive_mode
+  costs:
+    slippage_bps: 10
+    commission_bps: 3
+metrics:
+  primary:
+    - top10_avg_future_excess_ret_5d
+    - top10_up_hit_rate
+    - top10_big_up_hit_rate
+    - rank_ic
+    - icir
+    - walk_forward_stability
+    - annual_return
+    - sharpe
+    - calmar
+    - max_drawdown
+  secondary: [accuracy, f1, auc, win_rate]

@@ -1,0 +1,22 @@
+data_sources:
+  priority: [eastmoney, tencent, yahoo, stooq]
+  retry:
+    max_attempts: 3
+    backoff_seconds: 1
+  anomaly_price_diff_threshold: 0.03
+  cache_dir: data/raw/cache
+markets:
+  A:
+    benchmark: CSI300_MEDIAN_PROXY
+    min_listed_days: 120
+  H:
+    benchmark: HSI_MEDIAN_PROXY
+    min_listed_days: 120
+filters:
+  remove_suspended: true
+  remove_st: true
+  remove_delisting: true
+  liquidity_quantile: 0.2
+  extreme_price_zscore: 6
+adjustment: forward
+incremental_update: true

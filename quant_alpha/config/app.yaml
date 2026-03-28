@@ -1,0 +1,13 @@
+project:
+  name: quant_alpha
+  version: 0.1.0
+seed: 42
+paths:
+  data: data
+  db: db/quant_alpha.duckdb
+  logs: logs
+  artifacts: artifacts
+  reports: reports
+runtime:
+  auto_detect_gpu: true
+  timezone: Asia/Shanghai

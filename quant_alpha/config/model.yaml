@@ -1,0 +1,29 @@
+label:
+  horizon: 5
+  big_up_mode: fixed
+  big_up_threshold: 0.05
+  big_up_top_quantile: 0.15
+model:
+  ranker: lightgbm
+  lgbm_ranker:
+    objective: rank_xendcg
+    learning_rate: 0.05
+    n_estimators: 300
+    num_leaves: 63
+    min_data_in_leaf: 50
+    random_state: 42
+  weights:
+    w1: 0.45
+    w2: 0.25
+    w3: 0.20
+    w4: 0.05
+    w5: 0.03
+    w6: 0.02
+  strict_mode: false
+  top_n: 10
+  market_weight_tilt:
+    A: 1.0
+    H: 1.0
+features:
+  version: v1
+  transforms: [winsorize, zscore, rank_normalize]

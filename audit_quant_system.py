@@ -1,0 +1,567 @@
+import argparse
+import datetime as dt
+import json
+import math
+from collections import defaultdict
+from typing import Dict, List, Tuple, Set
+
+import quant_alpha_system as q
+
+GROUPS = {
+    "liquidity_price_volume": {"ret_1d", "ret_5d", "vol_ratio", "price_pos_20d", "amihud_20d", "vol_20d"},
+    "quality_profitability_proxy": {"ret_60d", "downside_vol_20d", "drawdown_20d"},
+    "industry_momentum": {"ret_20d", "rel_ret_5d", "ma_gap_10_30", "bm_trend_5d"},
+    "broker_revision": {"ib_top5_score"},
+    "sentiment_macro": {"mkt_breadth_5d", "oil_ret_5d", "vix_ret_5d"},
+}
+
+
+def rankdata(vals: List[float]) -> List[float]:
+    idx = sorted(range(len(vals)), key=lambda i: vals[i])
+    out = [0.0] * len(vals)
+    r = 1
+    i = 0
+    while i < len(idx):
+        j = i
+        while j + 1 < len(idx) and vals[idx[j + 1]] == vals[idx[i]]:
+            j += 1
+        avg_rank = 0.5 * (r + r + (j - i))
+        for k in range(i, j + 1):
+            out[idx[k]] = avg_rank
+        r += j - i + 1
+        i = j + 1
+    return out
+
+
+def spearman(x: List[float], y: List[float]) -> float:
+    if len(x) < 3 or len(y) != len(x):
+        return 0.0
+    rx = rankdata(x)
+    ry = rankdata(y)
+    mx = sum(rx) / len(rx)
+    my = sum(ry) / len(ry)
+    cov = sum((a - mx) * (b - my) for a, b in zip(rx, ry))
+    sx = math.sqrt(sum((a - mx) ** 2 for a in rx))
+    sy = math.sqrt(sum((b - my) ** 2 for b in ry))
+    if sx < 1e-12 or sy < 1e-12:
+        return 0.0
+    return cov / (sx * sy)
+
+
+def build_future_excess_map(data: Dict[str, List[q.Row]], benchmark: str, horizon: int) -> Dict[Tuple[dt.date, str], float]:
+    bm = data.get(benchmark, [])
+    bm_close = {r.date: r.close for r in bm}
+    out = {}
+    for tk, rows in data.items():
+        if tk == benchmark:
+            continue
+        for i in range(0, len(rows) - horizon):
+            d0 = rows[i].date
+            d1 = rows[i + horizon].date
+            if rows[i].close <= 0:
+                continue
+            r = rows[i + horizon].close / rows[i].close - 1.0
+            if d0 in bm_close and d1 in bm_close and bm_close[d0] > 0:
+                bm_r = bm_close[d1] / bm_close[d0] - 1.0
+                out[(d0, tk)] = r - bm_r
+            else:
+                out[(d0, tk)] = r
+    return out
+
+
+def evaluate(
+    data,
+    benchmark,
+    horizon,
+    topn,
+    disabled_groups: Set[str],
+    only_groups: Set[str] | None = None,
+    mode: str = "direct",
+    focus_group: str | None = None,
+    use_constraints: bool = False,
+    use_regime_overlay: bool = False,
+):
+    mkt = q.build_market_sentiment_map(data, benchmark)
+    macro = {}
+    samples = q.build_samples(
+        data,
+        horizon=horizon,
+        benchmark_ticker=benchmark,
+        institutional_factor={},
+        market_sentiment_map=mkt,
+        global_macro_map=macro,
+        use_liquidity_factor=True,
+    )
+    train, test = q.train_test_split(samples, split_ratio=0.8)
+    x_train, y_train, x_test, y_test, _m, _s = q.standardize(train, test)
+    w, b = q.train_logistic_sgd(x_train, y_train)
+
+    use = [1.0] * len(q.FEATURE_NAMES)
+    for i, f in enumerate(q.FEATURE_NAMES):
+        gnames = [g for g, fs in GROUPS.items() if f in fs]
+        if any(g in disabled_groups for g in gnames):
+            use[i] = 0.0
+        if only_groups is not None and gnames and all(g not in only_groups for g in gnames):
+            use[i] = 0.0
+
+    x_test_mask = q.apply_feature_scalers(x_test, use)
+    probs = q.predict_prob(w, b, x_test_mask)
+    fex = build_future_excess_map(data, benchmark, horizon)
+
+    idx_map = {f: i for i, f in enumerate(q.FEATURE_NAMES)}
+    fg_idx = [idx_map[f] for f in GROUPS.get(focus_group or "", set()) if f in idx_map]
+
+    by_day = defaultdict(list)
+    for s, p, xv in zip(test, probs, x_test):
+        ex = fex.get((s.date, s.ticker))
+        if ex is None:
+            continue
+        gsig = sum(xv[i] for i in fg_idx) / len(fg_idx) if fg_idx else 0.0
+        by_day[s.date].append((s.ticker, p, ex, gsig))
+
+    daily_ret = []
+    daily_ic = []
+    prev_set = set()
+    turn_sum = 0.0
+    a_contrib = 0.0
+    h_contrib = 0.0
+    a_n = h_n = 0
+    phase = defaultdict(list)
+    concentration_sum = 0.0
+    conc_days = 0
+
+    bm_rows = data.get(benchmark, [])
+    bm_close = {r.date: r.close for r in bm_rows}
+    bm_dates = sorted(bm_close.keys())
+    for d in sorted(by_day.keys()):
+        arr0 = by_day[d]
+        day_g = sum(x[3] for x in arr0) / max(1, len(arr0))
+        if mode == "filter" and day_g < 0:
+            continue
+        arr = []
+        for tk, p, ex, gsig in arr0:
+            if mode == "filter" and gsig < 0:
+                continue
+            if mode == "confidence":
+                p = p * (1.0 + 0.15 * q.clip_tanh(gsig, scale=1.5))
+            arr.append((tk, p, ex, gsig))
+        if not arr:
+            continue
+        arr = sorted(arr, key=lambda x: x[1], reverse=True)
+
+        # regime overlay: adjust recommendation count
+        target_n = min(topn, len(arr))
+        if use_regime_overlay:
+            idx = next((i for i, bd in enumerate(bm_dates) if bd == d), -1)
+            if idx >= 60:
+                ma20 = sum(bm_close[bm_dates[j]] for j in range(idx - 19, idx + 1)) / 20
+                ma60 = sum(bm_close[bm_dates[j]] for j in range(idx - 59, idx + 1)) / 60
+                if bm_close[d] > ma20 and bm_close[d] > ma60:
+                    target_n = min(target_n, 10)
+                elif bm_close[d] < ma20 and bm_close[d] < ma60:
+                    target_n = min(target_n, 3)
+                else:
+                    target_n = min(target_n, 6)
+
+        # confidence filter: weak dispersion -> reduce names
+        if len(arr) >= 6:
+            top_probs = [x[1] for x in arr[: min(10, len(arr))]]
+            meanp = sum(top_probs) / len(top_probs)
+            stdp = math.sqrt(sum((x - meanp) ** 2 for x in top_probs) / max(1, len(top_probs) - 1))
+            if stdp < 0.025:
+                target_n = min(target_n, 6)
+
+        if use_constraints:
+            picked = []
+            sec_cnt = defaultdict(int)
+            high_vol_cnt = 0
+            small_cap_cnt = 0
+            for tk, p, ex, gsig in arr:
+                xraw = next((x for s, pp, x in zip(test, probs, x_test) if s.ticker == tk and abs(pp - p) < 1e-12), None)
+                vol_z = xraw[q.FEATURE_NAMES.index("vol_20d")] if xraw is not None and "vol_20d" in q.FEATURE_NAMES else 0.0
+                amihud_z = xraw[q.FEATURE_NAMES.index("amihud_20d")] if xraw is not None and "amihud_20d" in q.FEATURE_NAMES else 0.0
+                is_high_vol = vol_z > 0.8
+                is_smallcap_proxy = amihud_z > 0.6
+                is_low_liq = amihud_z > (1.1 if tk.endswith('.HK') else 1.3)
+                sec = q.infer_sector(tk)
+                if is_low_liq:
+                    continue
+                if sec_cnt[sec] >= 2:
+                    continue
+                if is_high_vol and high_vol_cnt >= 3:
+                    continue
+                if is_smallcap_proxy and small_cap_cnt >= 3:
+                    continue
+                picked.append((tk, p, ex, gsig))
+                sec_cnt[sec] += 1
+                if is_high_vol:
+                    high_vol_cnt += 1
+                if is_smallcap_proxy:
+                    small_cap_cnt += 1
+                if len(picked) >= target_n:
+                    break
+            sel = picked
+        else:
+            sel = arr[: target_n]
+        if not sel:
+            continue
+        ret = sum(x[2] for x in sel) / len(sel)
+        daily_ret.append((d, ret))
+        daily_ic.append(spearman([x[1] for x in arr], [x[2] for x in arr]))
+        cur_set = {x[0] for x in sel}
+        if prev_set:
+            turn_sum += 1 - len(cur_set & prev_set) / max(1, len(cur_set | prev_set))
+        prev_set = cur_set
+        sec_count = defaultdict(int)
+        for tk in cur_set:
+            sec_count[q.infer_sector(tk)] += 1
+        hhi = sum((c / max(1, len(cur_set))) ** 2 for c in sec_count.values())
+        concentration_sum += hhi
+        conc_days += 1
+        for tk, _p, ex, _gsig in sel:
+            if tk.endswith('.HK'):
+                h_contrib += ex
+                h_n += 1
+            else:
+                a_contrib += ex
+                a_n += 1
+        # simple phase by benchmark above MA60
+        idx = next((i for i, bd in enumerate(bm_dates) if bd == d), -1)
+        if idx >= 60:
+            ma20 = sum(bm_close[bm_dates[j]] for j in range(idx - 19, idx + 1)) / 20
+            ma60 = sum(bm_close[bm_dates[j]] for j in range(idx - 59, idx + 1)) / 60
+            if bm_close[d] > ma20 and bm_close[d] > ma60:
+                ph = 'risk_on'
+            elif bm_close[d] < ma20 and bm_close[d] < ma60:
+                ph = 'risk_off'
+            else:
+                ph = 'neutral'
+            phase[ph].append(ret)
+
+    rs = [r for _d, r in daily_ret]
+    if not rs:
+        return {}
+    eq = [1.0]
+    for r in rs:
+        eq.append(eq[-1] * (1 + r))
+    peak = eq[0]
+    mdd = 0.0
+    for v in eq:
+        peak = max(peak, v)
+        mdd = min(mdd, v / peak - 1.0)
+    mean = sum(rs) / len(rs)
+    std = math.sqrt(sum((x - mean) ** 2 for x in rs) / max(1, len(rs) - 1))
+    sharpe = (mean / std * math.sqrt(252)) if std > 1e-12 else 0.0
+    ann = (eq[-1] ** (252 / max(1, len(rs))) - 1.0)
+    calmar = ann / abs(mdd) if mdd < 0 else 0.0
+    pos = [x for x in rs if x > 0]
+    neg = [x for x in rs if x <= 0]
+    payoff = (sum(pos) / len(pos)) / abs(sum(neg) / len(neg)) if pos and neg and abs(sum(neg)) > 1e-12 else 0.0
+
+    info_ratio = sharpe
+    turnover = turn_sum / max(1, len(rs) - 1)
+    utility = ann - 0.50 * turnover - 0.30 * abs(mdd)
+    return {
+        'days': len(rs),
+        'cum_excess_return': eq[-1] - 1.0,
+        'annualized_excess_return': ann,
+        'max_drawdown': mdd,
+        'sharpe': sharpe,
+        'information_ratio': info_ratio,
+        'calmar': calmar,
+        'win_rate': len(pos) / len(rs),
+        'payoff_ratio': payoff,
+        'turnover': turnover,
+        'concentration_hhi': concentration_sum / max(1, conc_days),
+        'rankic': sum(daily_ic) / max(1, len(daily_ic)),
+        'rankic_ir': (sum(daily_ic) / len(daily_ic)) / (math.sqrt(sum((x - (sum(daily_ic)/len(daily_ic)))**2 for x in daily_ic) / max(1, len(daily_ic)-1)) + 1e-12),
+        'utility_score': utility,
+        'a_alpha': a_contrib / max(1, a_n),
+        'h_alpha': h_contrib / max(1, h_n),
+        'phase_alpha': {k: (sum(v) / len(v) if v else 0.0) for k, v in phase.items()},
+    }
+
+
+def md_table(rows: List[List[str]]) -> str:
+    if not rows:
+        return ''
+    out = ['| ' + ' | '.join(rows[0]) + ' |', '| ' + ' | '.join(['---'] * len(rows[0])) + ' |']
+    for r in rows[1:]:
+        out.append('| ' + ' | '.join(r) + ' |')
+    return '\n'.join(out)
+
+
+def trim_demo_data(
+    data: Dict[str, List[q.Row]],
+    benchmark: str,
+    max_tickers: int,
+    max_days: int,
+) -> Dict[str, List[q.Row]]:
+    if not data:
+        return {}
+    ordered = list(data.keys())
+    selected: List[str] = []
+    if benchmark in data:
+        selected.append(benchmark)
+    for tk in ordered:
+        if tk == benchmark:
+            continue
+        selected.append(tk)
+        if len(selected) >= max_tickers:
+            break
+
+    out: Dict[str, List[q.Row]] = {}
+    for tk in selected:
+        rows = data.get(tk, [])
+        if max_days > 0 and len(rows) > max_days:
+            out[tk] = rows[-max_days:]
+        else:
+            out[tk] = rows
+    return out
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--benchmark', default='000300.SS')
+    ap.add_argument('--horizon', type=int, default=5)
+    ap.add_argument('--topn', type=int, default=10)
+    ap.add_argument('--output-md', default='audit_report.md')
+    ap.add_argument('--demo-tickers', type=int, default=18, help='Synthetic universe size used by audit (including benchmark).')
+    ap.add_argument('--demo-days', type=int, default=360, help='Recent synthetic trading days used by audit.')
+    args = ap.parse_args()
+
+    data = q.generate_demo_data(seed=42)
+    data = trim_demo_data(
+        data,
+        benchmark=args.benchmark,
+        max_tickers=max(3, args.demo_tickers),
+        max_days=max(120, args.demo_days),
+    )
+
+    eval_cache = {}
+
+    def cached_evaluate(
+        disabled_groups=None,
+        only_groups=None,
+        mode="direct",
+        focus_group=None,
+        use_constraints=False,
+        use_regime_overlay=False,
+    ):
+        dg = tuple(sorted(disabled_groups or set()))
+        og = tuple(sorted(only_groups or set()))
+        key = (dg, og, mode, focus_group, use_constraints, use_regime_overlay)
+        if key not in eval_cache:
+            eval_cache[key] = evaluate(
+                data,
+                args.benchmark,
+                args.horizon,
+                args.topn,
+                disabled_groups=set(dg),
+                only_groups=set(og) if og else None,
+                mode=mode,
+                focus_group=focus_group,
+                use_constraints=use_constraints,
+                use_regime_overlay=use_regime_overlay,
+            )
+        return eval_cache[key]
+
+    baseline = cached_evaluate(disabled_groups=set(), use_constraints=False, use_regime_overlay=False)
+
+    ablation = {}
+    standalone = {}
+    for g in GROUPS:
+        ablation[g] = cached_evaluate(disabled_groups={g}, use_constraints=False, use_regime_overlay=False)
+        standalone[g] = cached_evaluate(disabled_groups=set(), only_groups={g}, use_constraints=False, use_regime_overlay=False)
+
+    placement = {}
+    for g in ["broker_revision", "sentiment_macro"]:
+        placement[g] = {
+            "direct": cached_evaluate(disabled_groups=set(), mode="direct", focus_group=g, use_constraints=False, use_regime_overlay=False),
+            "filter": cached_evaluate(disabled_groups={g}, mode="filter", focus_group=g, use_constraints=False, use_regime_overlay=False),
+            "confidence": cached_evaluate(disabled_groups={g}, mode="confidence", focus_group=g, use_constraints=False, use_regime_overlay=False),
+        }
+    # macro is included in sentiment_macro group above; keep explicit alias for readability
+    placement["global_macro"] = placement["sentiment_macro"]
+
+    lines = []
+    lines.append('# Quant System Structure Audit Report')
+    lines.append('')
+    lines.append('## 1) Pipeline Diagram')
+    lines.append('')
+    lines.append('```text')
+    lines.append('Data (A/H bars + benchmark + optional broker/mkt/macro)')
+    lines.append('  -> Feature Engineering (multi-group factors)')
+    lines.append('  -> Label: future excess return sign (horizon-based)')
+    lines.append('  -> Logistic SGD (binary classification)')
+    lines.append('  -> Multi-horizon fusion')
+    lines.append('  -> Regime overlay (risk_on/neutral/risk_off)')
+    lines.append('  -> Constrained pools (formal / backup / watch)')
+    lines.append('  -> Portfolio + risk/cost/BARRA + exit plan')
+    lines.append('  -> Reports (CLI + JSON/MD/CSV)')
+    lines.append('```')
+    lines.append('')
+    lines.append('## 2) Audit Answers')
+    lines.append('- 标签定义：`horizon` 日未来超额收益是否 > 0（二分类标签）。')
+    lines.append('- 模型类型：二分类模型（Logistic SGD），并按概率做排序。')
+    lines.append('- Top10 逻辑：先概率排序，再经市场状态与组合约束生成正式池。')
+    lines.append('- 外资/情绪/宏观注入方式：作为特征进入模型（并可在上层作为 regime/置信度参考）。')
+    lines.append('- 行业/市值中性化：当前无严格回归中性化（行业仅用于组合约束；市值代理尚弱）。')
+    lines.append('- 回测假设：当前核心回测侧重超额收益方向与组合收益统计；交易成本/滑点/涨跌停实盘约束仍需进一步细化。')
+    lines.append('')
+    lines.append('## 3) Key Metrics (baseline, primary = excess-return quality)')
+    rows = [["metric", "value"]] + [[k, f"{v:.6f}" if isinstance(v, float) else json.dumps(v, ensure_ascii=False)] for k, v in baseline.items()]
+    lines.append(md_table(rows))
+    lines.append('')
+
+    # keep section order: first inventory/ablation/standalone/placement, then layer impact sections
+    lines.append('## 4) Factor Inventory')
+    inv = [["group", "factors"]]
+    for g, fs in GROUPS.items():
+        inv.append([g, ', '.join(sorted(fs))])
+    lines.append(md_table(inv))
+    lines.append('')
+    lines.append('## 5) Ablation (remove one group)')
+    rows = [["group", "cum_excess", "ann_excess", "max_dd", "IR", "turnover", "rankic", "utility"]]
+    for g, m in ablation.items():
+        if not m:
+            rows.append([g, 'NA', 'NA', 'NA', 'NA', 'NA', 'NA', 'NA'])
+            continue
+        rows.append([
+            g,
+            f"{m['cum_excess_return']:.4f}",
+            f"{m['annualized_excess_return']:.4f}",
+            f"{m['max_drawdown']:.4f}",
+            f"{m['information_ratio']:.4f}",
+            f"{m['turnover']:.4f}",
+            f"{m['rankic']:.4f}",
+            f"{m['utility_score']:.4f}",
+        ])
+    lines.append(md_table(rows))
+    lines.append('')
+    lines.append('## 6) Standalone Group Power')
+    rows = [["group", "cum_excess", "ann_excess", "max_dd", "IR", "turnover", "rankic", "utility"]]
+    for g, m in standalone.items():
+        if not m:
+            rows.append([g, 'NA', 'NA', 'NA', 'NA', 'NA', 'NA', 'NA'])
+            continue
+        rows.append([
+            g,
+            f"{m['cum_excess_return']:.4f}",
+            f"{m['annualized_excess_return']:.4f}",
+            f"{m['max_drawdown']:.4f}",
+            f"{m['information_ratio']:.4f}",
+            f"{m['turnover']:.4f}",
+            f"{m['rankic']:.4f}",
+            f"{m['utility_score']:.4f}",
+        ])
+    lines.append(md_table(rows))
+    lines.append('')
+    lines.append('## 7) Placement Test: direct vs filter vs confidence')
+    rows = [["group", "mode", "ann_excess", "IR", "max_dd", "turnover", "utility", "suggested_role"]]
+    for g, mp in placement.items():
+        best_mode = "direct"
+        best_u = -1e18
+        for mode, m in mp.items():
+            if not m:
+                continue
+            if m["utility_score"] > best_u:
+                best_u = m["utility_score"]
+                best_mode = mode
+        for mode, m in mp.items():
+            if not m:
+                continue
+            role = (
+                "core alpha" if mode == best_mode and mode == "direct" else
+                "regime signal" if mode == best_mode and mode == "filter" else
+                "confidence modifier" if mode == best_mode and mode == "confidence" else
+                "secondary"
+            )
+            rows.append([
+                g, mode,
+                f"{m['annualized_excess_return']:.4f}",
+                f"{m['information_ratio']:.4f}",
+                f"{m['max_drawdown']:.4f}",
+                f"{m['turnover']:.4f}",
+                f"{m['utility_score']:.4f}",
+                role,
+            ])
+    lines.append(md_table(rows))
+    lines.append('')
+
+    lines.append('## 7.5) Portfolio Layer Impact (constrained vs unconstrained)')
+    pc_base = cached_evaluate(disabled_groups=set(), use_constraints=False, use_regime_overlay=False)
+    pc_con = cached_evaluate(disabled_groups=set(), use_constraints=True, use_regime_overlay=False)
+    rows = [["setting", "ann_excess", "IR", "max_dd", "turnover", "concentration_hhi", "utility"]]
+    for name, m in [("unconstrained", pc_base), ("constrained", pc_con)]:
+        rows.append([
+            name,
+            f"{m['annualized_excess_return']:.4f}",
+            f"{m['information_ratio']:.4f}",
+            f"{m['max_drawdown']:.4f}",
+            f"{m['turnover']:.4f}",
+            f"{m['concentration_hhi']:.4f}",
+            f"{m['utility_score']:.4f}",
+        ])
+    lines.append(md_table(rows))
+    lines.append('')
+
+    lines.append('## 7.6) Regime Overlay Impact (old model intact + overlay)')
+    ov_base = cached_evaluate(disabled_groups=set(), use_constraints=False, use_regime_overlay=False)
+    ov_reg = cached_evaluate(disabled_groups=set(), use_constraints=False, use_regime_overlay=True)
+    ov_full = cached_evaluate(disabled_groups=set(), use_constraints=True, use_regime_overlay=True)
+    rows = [["setting", "ann_excess", "IR", "max_dd", "turnover", "win_rate", "utility", "phase_alpha"]]
+    for name, m in [("original", ov_base), ("+regime_overlay", ov_reg), ("+regime+constraints", ov_full)]:
+        rows.append([
+            name,
+            f"{m['annualized_excess_return']:.4f}",
+            f"{m['information_ratio']:.4f}",
+            f"{m['max_drawdown']:.4f}",
+            f"{m['turnover']:.4f}",
+            f"{m['win_rate']:.4f}",
+            f"{m['utility_score']:.4f}",
+            json.dumps(m.get('phase_alpha', {}), ensure_ascii=False),
+        ])
+    lines.append(md_table(rows))
+    lines.append('')
+
+    lines.append('## 8) Model Ranking by Excess-Return Quality (not hit-rate)')
+    comp = [
+        ("baseline", baseline),
+    ] + [(f"ablate_{k}", v) for k, v in ablation.items()] + [(f"standalone_{k}", v) for k, v in standalone.items()]
+    comp = [x for x in comp if x[1]]
+    comp.sort(key=lambda x: x[1]["utility_score"], reverse=True)
+    rows = [["model", "ann_excess", "IR", "max_dd", "turnover", "payoff", "win_rate", "utility"]]
+    for name, m in comp:
+        rows.append([
+            name,
+            f"{m['annualized_excess_return']:.4f}",
+            f"{m['information_ratio']:.4f}",
+            f"{m['max_drawdown']:.4f}",
+            f"{m['turnover']:.4f}",
+            f"{m['payoff_ratio']:.4f}",
+            f"{m['win_rate']:.4f}",
+            f"{m['utility_score']:.4f}",
+        ])
+    lines.append(md_table(rows))
+    lines.append('')
+
+    lines.append('## 9) Most Likely Issues')
+    lines.append('- 目标函数仍容易被“命中率”牵引，成本后信息比率优化不足。')
+    lines.append('- 市值/行业严格中性化缺失，风格漂移风险仍在。')
+    lines.append('- 成本、滑点、不可交易（停牌/涨跌停）的实盘约束尚需全量并入回测成交层。')
+    lines.append('- 外资/情绪/宏观三组的角色边界（核心 alpha vs 过滤器）还需通过年度稳定性进一步约束。')
+    lines.append('')
+    lines.append('## 10) Highest ROI Improvements')
+    lines.append('1. 先用“年化超额 + IR - 换手惩罚”做主排序指标。')
+    lines.append('2. 将外资/情绪/宏观从直接排序因子迁移为 regime/filter/confidence 层。')
+    lines.append('3. 在组合层补齐小市值上限与低流动性硬过滤。')
+    lines.append('4. 回测成交层纳入成本/滑点/不可交易约束，按年份与市场状态分解表现。')
+
+    with open(args.output_md, 'w', encoding='utf-8') as f:
+        f.write('\n'.join(lines) + '\n')
+    print(f'Saved audit report: {args.output_md}')
+
+
+if __name__ == '__main__':
+    main()

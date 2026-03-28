@@ -46,6 +46,8 @@ class Sample:
     features: List[float]
     target: int
     close: float
+    future_ret: float = 0.0
+    future_excess_ret: float = 0.0
 
 
 @dataclass
@@ -1198,9 +1200,11 @@ def build_samples(
             # v6: 以“同起止日期的超额收益”作为标签，更贴近指数增强目标
             d0 = rows[i].date
             d1 = rows[i + horizon].date
+            future_excess_ret = 0.0
             if d0 in bm_close_map and d1 in bm_close_map and bm_close_map[d0] > 0:
                 future_bm_ret = bm_close_map[d1] / bm_close_map[d0] - 1.0
-                target = 1 if (future_ret - future_bm_ret) > 0 else 0
+                future_excess_ret = future_ret - future_bm_ret
+                target = 1 if future_excess_ret > 0 else 0
             else:
                 target = 1 if future_ret > 0 else 0
 
@@ -1229,6 +1233,8 @@ def build_samples(
                     ],
                     target=target,
                     close=closes[i],
+                    future_ret=future_ret,
+                    future_excess_ret=future_excess_ret,
                 )
             )
 
@@ -1432,6 +1438,71 @@ def model_feature_contrib(model_obj: Dict[str, object], x: List[float]) -> List[
         return contrib
     w = model_obj["w"]  # type: ignore[index]
     return [w[j] * x[j] for j in range(len(w))]
+
+
+def train_linear_sgd(
+    x: List[List[float]],
+    y: List[float],
+    epochs: int = 40,
+    lr: float = 0.02,
+    l2: float = 1e-4,
+) -> Tuple[List[float], float]:
+    n_feat = len(x[0])
+    w = [0.0] * n_feat
+    b = 0.0
+    idx = list(range(len(x)))
+    rng = random.Random(321)
+    for _ in range(epochs):
+        rng.shuffle(idx)
+        for i in idx:
+            pred = sum(w[j] * x[i][j] for j in range(n_feat)) + b
+            err = pred - y[i]
+            for j in range(n_feat):
+                grad = err * x[i][j] + l2 * w[j]
+                w[j] -= lr * grad
+            b -= lr * err
+    return w, b
+
+
+def predict_linear(w: List[float], b: float, x: List[List[float]]) -> List[float]:
+    return [sum(w[j] * row[j] for j in range(len(w))) + b for row in x]
+
+
+def mean_std(arr: List[float]) -> Tuple[float, float]:
+    if not arr:
+        return 0.0, 1.0
+    mu = sum(arr) / len(arr)
+    var = sum((x - mu) ** 2 for x in arr) / max(1, len(arr) - 1)
+    return mu, max(1e-8, math.sqrt(var))
+
+
+def zscore(x: float, mu: float, sd: float) -> float:
+    return (x - mu) / max(sd, 1e-8)
+
+
+def build_relevance_map(samples: List[Sample]) -> Dict[Tuple[dt.date, str], int]:
+    out: Dict[Tuple[dt.date, str], int] = {}
+    by_day: Dict[dt.date, List[Tuple[str, float]]] = defaultdict(list)
+    for s in samples:
+        val = s.future_excess_ret if abs(s.future_excess_ret) > 1e-12 else s.future_ret
+        by_day[s.date].append((s.ticker, val))
+    for d, arr in by_day.items():
+        arr = sorted(arr, key=lambda x: x[1], reverse=True)
+        n = len(arr)
+        for i, (tk, _v) in enumerate(arr):
+            q = (i + 1) / max(n, 1)
+            if q <= 0.10:
+                lv = 4
+            elif q <= 0.30:
+                lv = 3
+            elif q <= 0.50:
+                lv = 2
+            elif q <= 0.70:
+                lv = 1
+            else:
+                lv = 0
+            out[(d, tk)] = lv
+    return out
 
 
 def best_threshold(y_true: List[int], y_prob: List[float]) -> float:
@@ -2111,8 +2182,10 @@ def main():
     parser.add_argument("--start", type=str, default="2021-01-01")
     parser.add_argument("--end", type=str, default=dt.date.today().isoformat())
     parser.add_argument("--horizon", type=int, default=5, help="Single horizon fallback (legacy)")
-    parser.add_argument("--horizons", type=str, default="5,10,20", help="Multi-horizon labels, e.g. 5,10,20")
-    parser.add_argument("--horizon-weights", type=str, default="0.2,0.3,0.5", help="Weights for horizons")
+    parser.add_argument("--horizons", type=str, default="5", help="Primary horizon labels, default 5 for stock-picking")
+    parser.add_argument("--horizon-weights", type=str, default="1.0", help="Weights for horizons")
+    parser.add_argument("--strong-up-threshold", type=float, default=0.03, help="Strong-up label threshold for future 5d return")
+    parser.add_argument("--down-threshold", type=float, default=-0.02, help="Downside-risk label threshold for future 5d return")
     parser.add_argument(
         "--model-type",
         type=str,
@@ -2133,6 +2206,14 @@ def main():
     parser.add_argument("--benchmark", type=str, default="000300.SS", help="Benchmark ticker for excess-return label")
     parser.add_argument("--max-weight", type=float, default=0.35, help="Max single-stock weight in suggested portfolio")
     parser.add_argument("--risk-aversion", type=float, default=0.15, help="Penalty coefficient for risk_20d in portfolio scoring")
+    parser.add_argument("--score-w-excess", type=float, default=0.30)
+    parser.add_argument("--score-w-ret", type=float, default=0.20)
+    parser.add_argument("--score-w-up", type=float, default=0.20)
+    parser.add_argument("--score-w-strong", type=float, default=0.15)
+    parser.add_argument("--score-w-rank", type=float, default=0.15)
+    parser.add_argument("--risk-w-down", type=float, default=0.35)
+    parser.add_argument("--risk-w-vol", type=float, default=0.25)
+    parser.add_argument("--risk-w-dd", type=float, default=0.20)
     parser.set_defaults(barra_risk_control=True)
     parser.add_argument(
         "--barra-risk-control",
@@ -2381,6 +2462,7 @@ def main():
     h_weights = normalize_weights(parse_float_list(args.horizon_weights), len(horizons))
 
     per_horizon_maps: Dict[int, Dict[str, Tuple[float, float, float, str]]] = {}
+    per_horizon_detail_maps: Dict[int, Dict[str, Dict[str, float]]] = {}
     per_horizon_contrib_maps: Dict[int, Dict[str, List[float]]] = {}
     per_horizon_feature_scalers: Dict[int, List[float]] = {}
     per_horizon_test: Dict[int, List[Tuple[dt.date, str, float, int]]] = {}
@@ -2408,17 +2490,46 @@ def main():
         if not train or not test:
             continue
         x_train, y_train, x_test, y_test, means, stds = standardize(train, test)
+        rel_map = build_relevance_map(samples_h)
+        y_train_strong = [1 if s.future_ret >= args.strong_up_threshold else 0 for s in train]
+        y_test_strong = [1 if s.future_ret >= args.strong_up_threshold else 0 for s in test]
+        y_train_down = [1 if s.future_ret <= args.down_threshold else 0 for s in train]
+        y_test_down = [1 if s.future_ret <= args.down_threshold else 0 for s in test]
+        y_train_ret = [s.future_ret for s in train]
+        y_test_ret = [s.future_ret for s in test]
+        y_train_ex = [s.future_excess_ret for s in train]
+        y_test_ex = [s.future_excess_ret for s in test]
+        y_train_rel = [float(rel_map.get((s.date, s.ticker), 0)) / 4.0 for s in train]
+        y_test_rel = [float(rel_map.get((s.date, s.ticker), 0)) / 4.0 for s in test]
         base_scalers = [1.0] * len(FEATURE_NAMES)
         x_train_base = apply_feature_scalers(x_train, base_scalers)
         x_test_base = apply_feature_scalers(x_test, base_scalers)
         model_base, probs_base = train_model_and_predict(args.model_type, x_train_base, y_train, x_test_base)
+        model_strong_base, probs_strong_base = train_model_and_predict("logistic", x_train_base, y_train_strong, x_test_base)
+        model_down_base, probs_down_base = train_model_and_predict("logistic", x_train_base, y_train_down, x_test_base)
+        w_ret_base, b_ret_base = train_linear_sgd(x_train_base, y_train_ret)
+        pred_ret_base = predict_linear(w_ret_base, b_ret_base, x_test_base)
+        w_ex_base, b_ex_base = train_linear_sgd(x_train_base, y_train_ex)
+        pred_ex_base = predict_linear(w_ex_base, b_ex_base, x_test_base)
+        w_rel_base, b_rel_base = train_linear_sgd(x_train_base, y_train_rel)
+        pred_rel_base = predict_linear(w_rel_base, b_rel_base, x_test_base)
         t_base = best_threshold(y_test, probs_base)
         m_base = compute_metrics(y_test, probs_base, threshold=t_base)
-        wr_base = holdout_top20_winrate(test, probs_base, y_test)
+        wr_base = holdout_top20_winrate(test, pred_ex_base, y_test)
 
         scalers = base_scalers
         model_obj = model_base
+        model_strong = model_strong_base
+        model_down = model_down_base
+        reg_ret = (w_ret_base, b_ret_base)
+        reg_ex = (w_ex_base, b_ex_base)
+        reg_rel = (w_rel_base, b_rel_base)
         probs = probs_base
+        probs_strong = probs_strong_base
+        probs_down = probs_down_base
+        pred_ret = pred_ret_base
+        pred_ex = pred_ex_base
+        pred_rel = pred_rel_base
         t = t_base
         m = m_base
 
@@ -2427,13 +2538,31 @@ def main():
             x_train_t = apply_feature_scalers(x_train, cand_scalers)
             x_test_t = apply_feature_scalers(x_test, cand_scalers)
             model_t, probs_t = train_model_and_predict(args.model_type, x_train_t, y_train, x_test_t)
+            model_strong_t, probs_strong_t = train_model_and_predict("logistic", x_train_t, y_train_strong, x_test_t)
+            model_down_t, probs_down_t = train_model_and_predict("logistic", x_train_t, y_train_down, x_test_t)
+            w_ret_t, b_ret_t = train_linear_sgd(x_train_t, y_train_ret)
+            pred_ret_t = predict_linear(w_ret_t, b_ret_t, x_test_t)
+            w_ex_t, b_ex_t = train_linear_sgd(x_train_t, y_train_ex)
+            pred_ex_t = predict_linear(w_ex_t, b_ex_t, x_test_t)
+            w_rel_t, b_rel_t = train_linear_sgd(x_train_t, y_train_rel)
+            pred_rel_t = predict_linear(w_rel_t, b_rel_t, x_test_t)
             t_t = best_threshold(y_test, probs_t)
             m_t = compute_metrics(y_test, probs_t, threshold=t_t)
-            wr_t = holdout_top20_winrate(test, probs_t, y_test)
+            wr_t = holdout_top20_winrate(test, pred_ex_t, y_test)
             if (wr_t > wr_base) or (wr_t == wr_base and m_t.auc >= m_base.auc):
                 scalers = cand_scalers
                 model_obj = model_t
+                model_strong = model_strong_t
+                model_down = model_down_t
+                reg_ret = (w_ret_t, b_ret_t)
+                reg_ex = (w_ex_t, b_ex_t)
+                reg_rel = (w_rel_t, b_rel_t)
                 probs = probs_t
+                probs_strong = probs_strong_t
+                probs_down = probs_down_t
+                pred_ret = pred_ret_t
+                pred_ex = pred_ex_t
+                pred_rel = pred_rel_t
                 t = t_t
                 m = m_t
         metrics_rows.append((h, len(train), len(test), t, m.accuracy, m.precision, m.auc))
@@ -2444,12 +2573,28 @@ def main():
         latest_dates.append(latest_date)
         latest = [s for s in samples_h if s.date == latest_date]
         mapp: Dict[str, Tuple[float, float, float, str]] = {}
+        detail_map: Dict[str, Dict[str, float]] = {}
         cmap: Dict[str, List[float]] = {}
+        ex_list: List[float] = []
+        ret_list: List[float] = []
+        up_list: List[float] = []
+        strong_list: List[float] = []
+        rank_list: List[float] = []
+        down_list: List[float] = []
+        vol_list: List[float] = []
+        dd_list: List[float] = []
+        temp_rows: List[Tuple[Sample, float, float, float, float, float, float, List[float], float, str]] = []
         for s in latest:
             x = [((s.features[i] - means[i]) / stds[i]) * scalers[i] for i in range(len(means))]
-            p = model_predict_one(model_obj, x)
+            p = model_predict_one(model_obj, x)  # prob_up_5d
+            p_strong = model_predict_one(model_strong, x)
+            p_down = model_predict_one(model_down, x)
+            r_ret = sum(reg_ret[0][j] * x[j] for j in range(len(x))) + reg_ret[1]
+            r_ex = sum(reg_ex[0][j] * x[j] for j in range(len(x))) + reg_ex[1]
+            r_rank = sum(reg_rel[0][j] * x[j] for j in range(len(x))) + reg_rel[1]
             contrib = model_feature_contrib(model_obj, x)
             risk20 = s.features[4] if len(s.features) > 4 else 0.0
+            drawdown20 = s.features[15] if len(s.features) > 15 else 0.0
             if latest_quote and s.ticker in latest_quote:
                 px, ts = latest_quote[s.ticker]
                 src = format_live_src(ts)
@@ -2459,9 +2604,51 @@ def main():
                     px, src = lb.close, f"daily@{lb.date.isoformat()}"
                 else:
                     px, src = s.close, f"daily@{latest_date.isoformat()}"
-            mapp[s.ticker] = (px, p, risk20, src)
+            ex_list.append(r_ex)
+            ret_list.append(r_ret)
+            up_list.append(p)
+            strong_list.append(p_strong)
+            rank_list.append(r_rank)
+            down_list.append(p_down)
+            vol_list.append(risk20)
+            dd_list.append(drawdown20)
+            temp_rows.append((s, p, p_strong, p_down, r_ret, r_ex, r_rank, contrib, risk20, src))
+        ex_mu, ex_sd = mean_std(ex_list)
+        ret_mu, ret_sd = mean_std(ret_list)
+        up_mu, up_sd = mean_std(up_list)
+        strong_mu, strong_sd = mean_std(strong_list)
+        rank_mu, rank_sd = mean_std(rank_list)
+        down_mu, down_sd = mean_std(down_list)
+        vol_mu, vol_sd = mean_std(vol_list)
+        dd_mu, dd_sd = mean_std(dd_list)
+        for s, p, p_strong, p_down, r_ret, r_ex, r_rank, contrib, risk20, src in temp_rows:
+            drawdown20 = s.features[15] if len(s.features) > 15 else 0.0
+            gain_score = (
+                args.score_w_excess * zscore(r_ex, ex_mu, ex_sd)
+                + args.score_w_ret * zscore(r_ret, ret_mu, ret_sd)
+                + args.score_w_up * zscore(p, up_mu, up_sd)
+                + args.score_w_strong * zscore(p_strong, strong_mu, strong_sd)
+                + args.score_w_rank * zscore(r_rank, rank_mu, rank_sd)
+            )
+            risk_penalty = (
+                args.risk_w_down * zscore(p_down, down_mu, down_sd)
+                + args.risk_w_vol * zscore(risk20, vol_mu, vol_sd)
+                + args.risk_w_dd * zscore(drawdown20, dd_mu, dd_sd)
+            )
+            final_score = gain_score - risk_penalty
+            mapp[s.ticker] = (s.close, final_score, risk20, src)
+            detail_map[s.ticker] = {
+                "prob_up_5d": p,
+                "prob_strong_up_5d": p_strong,
+                "pred_ret_5d": r_ret,
+                "pred_excess_ret_5d": r_ex,
+                "downside_risk": p_down,
+                "rank_score": r_rank,
+                "final_score": final_score,
+            }
             cmap[s.ticker] = contrib
         per_horizon_maps[h] = mapp
+        per_horizon_detail_maps[h] = detail_map
         per_horizon_contrib_maps[h] = cmap
 
     if not per_horizon_maps and args.cn_etf_rotation:
@@ -2548,11 +2735,21 @@ def main():
         h_weights = auto_tune_horizon_weights(horizons, per_horizon_test)
     horizon_weight_map = {h: h_weights[i] for i, h in enumerate(horizons)}
     ranked_all: List[Tuple[str, float, float, float, str, List[float]]] = []
+    ranked_detail: Dict[str, Dict[str, float]] = {}
     for tk in tickers_union:
         num = 0.0
         den = 0.0
         picked: Optional[Tuple[float, float, str]] = None
         agg_contrib = [0.0 for _ in FEATURE_NAMES]
+        agg_detail = {
+            "prob_up_5d": 0.0,
+            "prob_strong_up_5d": 0.0,
+            "pred_ret_5d": 0.0,
+            "pred_excess_ret_5d": 0.0,
+            "downside_risk": 0.0,
+            "rank_score": 0.0,
+            "final_score": 0.0,
+        }
         for h in sorted(per_horizon_maps.keys(), reverse=True):
             mp = per_horizon_maps[h]
             if tk in mp:
@@ -2566,12 +2763,19 @@ def main():
                 if c and len(c) == len(agg_contrib):
                     for i in range(len(agg_contrib)):
                         agg_contrib[i] += w_h * c[i]
+                d_map = per_horizon_detail_maps.get(h, {})
+                d_obj = d_map.get(tk)
+                if d_obj:
+                    for k in agg_detail.keys():
+                        agg_detail[k] += w_h * float(d_obj.get(k, 0.0))
         if den <= 0:
             continue
         if picked is None:
             picked = (0.0, 0.0, "N/A")
         if den > 0:
             agg_contrib = [x / den for x in agg_contrib]
+            agg_detail = {k: (v / den) for k, v in agg_detail.items()}
+        ranked_detail[tk] = agg_detail
         ranked_all.append((tk, picked[0], num / den, picked[1], picked[2], agg_contrib))
 
     ranked_all.sort(key=lambda x: x[2], reverse=True)
@@ -2687,11 +2891,22 @@ def main():
     for tk, px, p, risk20, src, contrib in top:
         nm = stock_name(tk, runtime_names)
         shown = f"{tk}({nm})"
+        det = ranked_detail.get(tk, {})
+        prob_up = det.get("prob_up_5d", p)
+        prob_strong = det.get("prob_strong_up_5d", 0.0)
+        pred_ret = det.get("pred_ret_5d", 0.0)
+        pred_ex = det.get("pred_excess_ret_5d", 0.0)
+        down_risk = det.get("downside_risk", 0.0)
+        final_score = det.get("final_score", p)
         sub = factor_subscores_from_contrib(contrib)
         risk_tag = "HIGH_RISK" if risk20 > 0.045 else "MED_RISK" if risk20 > 0.03 else "LOW_RISK"
         print(
-            f"{shown:26s} px={px:10.3f} up_prob={p:.4f} risk20={risk20:.4f} "
+            f"{shown:26s} px={px:10.3f} final_score={final_score:.4f} up_prob={prob_up:.4f} risk20={risk20:.4f} "
             f"sector={infer_sector(tk)} {risk_tag} [{src}]"
+        )
+        print(
+            f"{'':26s} prob_strong_up_5d={prob_strong:.4f} pred_ret_5d={pred_ret:+.4f} "
+            f"pred_excess_ret_5d={pred_ex:+.4f} downside_risk={down_risk:.4f}"
         )
         print(
             f"{'':26s} score(total={sub['total_score']:+.3f}) "
@@ -2714,19 +2929,32 @@ def main():
         print("----------------------------------------------")
         print(f"BACKUP POOL ({len(backup_pool)})")
         for tk, px, p, risk20, src, _c in backup_pool:
-            print(f"{tk:16s} p={p:.4f} risk20={risk20:.4f} sector={infer_sector(tk)} [{src}]")
+            det = ranked_detail.get(tk, {})
+            print(
+                f"{tk:16s} final={det.get('final_score', p):.4f} up={det.get('prob_up_5d', 0.0):.4f} "
+                f"ex5d={det.get('pred_excess_ret_5d', 0.0):+.4f} risk20={risk20:.4f} [{src}]"
+            )
     if watch_pool:
         print("----------------------------------------------")
         print(f"WATCH POOL ({len(watch_pool)})")
         for tk, px, p, risk20, src, _c in watch_pool:
-            print(f"{tk:16s} p={p:.4f} risk20={risk20:.4f} sector={infer_sector(tk)} [{src}]")
+            det = ranked_detail.get(tk, {})
+            print(
+                f"{tk:16s} final={det.get('final_score', p):.4f} up={det.get('prob_up_5d', 0.0):.4f} "
+                f"ex5d={det.get('pred_excess_ret_5d', 0.0):+.4f} risk20={risk20:.4f} [{src}]"
+            )
 
     print("----------------------------------------------")
     print("SUGGESTED PORTFOLIO (alpha+risk+cost)")
     for tk, wt, p, risk20, src, b_risk in portfolio:
         nm = stock_name(tk, runtime_names)
         shown = f"{tk}({nm})"
-        print(f"{shown:26s} weight={wt:6.2%} up_prob={p:.4f} risk20={risk20:.4f} barra={b_risk:.4f} [{src}]")
+        det = ranked_detail.get(tk, {})
+        print(
+            f"{shown:26s} weight={wt:6.2%} final={det.get('final_score', p):.4f} up={det.get('prob_up_5d', 0.0):.4f} "
+            f"ex5d={det.get('pred_excess_ret_5d', 0.0):+.4f} downside={det.get('downside_risk', 0.0):.4f} "
+            f"risk20={risk20:.4f} barra={b_risk:.4f} [{src}]"
+        )
     if args.prev_weights:
         print(f"Estimated turnover vs prev portfolio: {turnover:.2%}")
     if args.save_weights:
@@ -2765,7 +2993,12 @@ def main():
                     "name": stock_name(tk, runtime_names),
                     "market": infer_market(tk),
                     "sector": infer_sector(tk),
-                    "up_prob": round(p, 6),
+                    "prob_up_5d": round(ranked_detail.get(tk, {}).get("prob_up_5d", p), 6),
+                    "prob_strong_up_5d": round(ranked_detail.get(tk, {}).get("prob_strong_up_5d", 0.0), 6),
+                    "pred_ret_5d": round(ranked_detail.get(tk, {}).get("pred_ret_5d", 0.0), 6),
+                    "pred_excess_ret_5d": round(ranked_detail.get(tk, {}).get("pred_excess_ret_5d", 0.0), 6),
+                    "downside_risk": round(ranked_detail.get(tk, {}).get("downside_risk", 0.0), 6),
+                    "final_score": round(ranked_detail.get(tk, {}).get("final_score", p), 6),
                     "risk20": round(risk20, 6),
                     "source": src,
                     "scores": factor_subscores_from_contrib(contrib),
@@ -2779,11 +3012,27 @@ def main():
                 for tk, _px, p, risk20, src, contrib in top
             ],
             "backup_pool": [
-                {"ticker": tk, "up_prob": round(p, 6), "risk20": round(risk20, 6), "sector": infer_sector(tk)}
+                {
+                    "ticker": tk,
+                    "prob_up_5d": round(ranked_detail.get(tk, {}).get("prob_up_5d", 0.0), 6),
+                    "pred_excess_ret_5d": round(ranked_detail.get(tk, {}).get("pred_excess_ret_5d", 0.0), 6),
+                    "downside_risk": round(ranked_detail.get(tk, {}).get("downside_risk", 0.0), 6),
+                    "final_score": round(ranked_detail.get(tk, {}).get("final_score", p), 6),
+                    "risk20": round(risk20, 6),
+                    "sector": infer_sector(tk),
+                }
                 for tk, _px, p, risk20, _src, _c in backup_pool
             ],
             "watch_pool": [
-                {"ticker": tk, "up_prob": round(p, 6), "risk20": round(risk20, 6), "sector": infer_sector(tk)}
+                {
+                    "ticker": tk,
+                    "prob_up_5d": round(ranked_detail.get(tk, {}).get("prob_up_5d", 0.0), 6),
+                    "pred_excess_ret_5d": round(ranked_detail.get(tk, {}).get("pred_excess_ret_5d", 0.0), 6),
+                    "downside_risk": round(ranked_detail.get(tk, {}).get("downside_risk", 0.0), 6),
+                    "final_score": round(ranked_detail.get(tk, {}).get("final_score", p), 6),
+                    "risk20": round(risk20, 6),
+                    "sector": infer_sector(tk),
+                }
                 for tk, _px, p, risk20, _src, _c in watch_pool
             ],
             "position_range": market_state.get("position_range"),
@@ -2810,9 +3059,13 @@ def main():
         ]
         for i, (tk, _px, p, risk20, _src, contrib) in enumerate(top, 1):
             sub = factor_subscores_from_contrib(contrib)
+            det = ranked_detail.get(tk, {})
             lines.append(
-                f"{i}. **{tk}** ({infer_sector(tk)}) prob={p:.4f}, risk20={risk20:.4f}, "
-                f"total_score={sub['total_score']:+.3f}"
+                f"{i}. **{tk}** ({infer_sector(tk)}) final={det.get('final_score', p):.4f}, "
+                f"up={det.get('prob_up_5d', 0.0):.4f}, strong={det.get('prob_strong_up_5d', 0.0):.4f}, "
+                f"ret5d={det.get('pred_ret_5d', 0.0):+.4f}, excess5d={det.get('pred_excess_ret_5d', 0.0):+.4f}, "
+                f"down={det.get('downside_risk', 0.0):.4f}, risk20={risk20:.4f}, "
+                f"factor_total={sub['total_score']:+.3f}"
             )
         lines.append("")
         lines.append("## Backup Pool")

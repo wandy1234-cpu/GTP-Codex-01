@@ -1,21 +1,27 @@
-# A/H 股票上涨概率系统（Pro v10：多周期标签融合 + 指数增强）
+# A/H 未来5日高概率高涨幅选股系统（兼容指数增强 / ETF 轮动）
 
-本次升级目标：
-- **优先实时**：支持东财实时行情刷新（中国大陆源）+ Yahoo 备用
-- **兜底最新**：若实时不可得，自动使用最新日线数据
-- **多数据源**：支持 `eastmoney,tencent,yahoo,stooq` 级联抓取，提高 A/H 数据可用性
-- **更偏 Alpha**：标签升级为“相对基准超额收益 > 0”（缺基准时回退绝对收益）
-- **新增组合建议**：输出 alpha 导向的建议权重（带单票权重上限）
-- **新增风控/换手感知**：组合打分加入风险惩罚与成本惩罚，并支持读取上期权重估算换手
-- **新增实时数据库**：使用 SQLite 缓存历史与实时行情，支持断网回退继续运行
-- **专业输出格式**：终端报告增加系统名、策略介绍、运行时间、数据来源、模型区块
-- **可读性升级**：股票代码后自动显示股票名称（如 `000858.SZ(五粮液)`）
-- **名称来源升级**：优先从东财/腾讯实时接口获取股票中文名，并写入 SQLite 缓存
-- **TopN 修正**：请求多少条就返回多少条（不足时用占位行提示）
-- **多周期标签融合**：支持 `5/10/20`（可自定义），更贴合指数增强的多周期alpha框架
-- 仍保持纯 Python（无第三方库）
+## 结论先行（默认模式）
 
-## 1) 默认运行（实时优先）
+本系统默认目标不是“多周期平台”，而是：
+> 在 T 日收盘后，用 **T 日可得数据** 选出未来 **5 个交易日**“上涨概率高、预期涨幅高、超额收益高、下行风险可控”的 TopN 股票，并输出建议权重。
+
+默认输出（正式池每只股票）：
+- `prob_up_5d`
+- `prob_strong_up_5d`
+- `pred_ret_5d`
+- `pred_excess_ret_5d`
+- `downside_risk`
+- `final_score`
+
+同时保留工程资产（不推翻）：
+- 多源行情级联：`eastmoney / tencent / yahoo / stooq`
+- 实时 + 日线回退
+- SQLite 缓存（history / quotes / names）
+- 组合层：权重上限、成本惩罚、BARRA 风险约束
+- Web 控制台、ETF 模式、DB-only、demo
+- 纯 Python 默认可运行（无第三方强依赖）
+
+## 1) 默认运行（股票 5 日 TopN 主模式）
 
 ```bash
 python quant_alpha_system.py
@@ -48,9 +54,12 @@ python quant_alpha_system.py
 - `--cn-etf-rotation`（启用大陆 ETF 轮动模式：自动拉取沪深 ETF 池）
 - `--cn-etf-limit 800`（大陆 ETF 池拉取上限）
 - `--etf-live-limit 120`（ETF 在线模式自动截断股票池，避免超时）
-- `--horizons 5,10,20`（多标签周期）
-- `--horizon-weights 0.2,0.3,0.5`（多标签融合权重）
-- `--model-type mlp|logistic`（模型类型，默认 `mlp` 深度学习）
+- `--horizons 5`（默认聚焦 5 日主目标）
+- `--horizon-weights 1.0`（默认单周期）
+- `--strong-up-threshold 0.03`（强上涨标签阈值）
+- `--down-threshold -0.02`（下行风险标签阈值）
+- `--model-type mlp|logistic`（默认 `mlp`，logistic 作为纯 Python baseline 备选）
+- 评分权重参数：`--score-w-*` 与 `--risk-w-*`（收益-风险统一评分）
 - `--auto-tune-horizon-weights`（根据 holdout 回测胜率自动反推多周期融合权重）
 - `--min-samples 500`（每个 horizon 最低样本门槛；ETF 模式默认自动放宽到 180）
 - `--report-csv one_year_report.csv`（导出近1年每日胜率报告）
@@ -70,6 +79,13 @@ python quant_alpha_system.py
 - 稳定性增强：若本次在线刷新得到的共同日期比本地 DB 快照更旧，程序会自动保留 DB 快照，避免同日结果大幅漂移
 
 > 若你看到“互联网访问关闭/离线模式”提示，可直接按默认参数运行；程序会自动清理常见离线环境变量。
+
+## 1.1) 模式分层（避免主目标被稀释）
+
+- **默认模式（股票 5 日选股）**：本项目主模式，优先优化。  
+- **ETF 模式**：附加模式，参数应更保守（更高成本惩罚、更强流动性约束）。  
+- **纯 Python baseline**：`--model-type logistic`，用于稳态和对照。  
+- **增强模式**：`--model-type mlp`，在不破坏默认可运行前提下提升排序质量。
 
 ## 2) 指定数据窗口与股票池
 

@@ -1250,6 +1250,20 @@ def train_test_split(samples: List[Sample], split_ratio: float = 0.8) -> Tuple[L
     return train, test
 
 
+def trim_samples_to_recent_window(samples: List[Sample], lookback_days: int) -> List[Sample]:
+    """
+    Keep only the most recent `lookback_days` trading dates to avoid
+    old-history dominance that can make day-to-day outputs too static.
+    """
+    if lookback_days <= 0 or not samples:
+        return samples
+    dates = sorted({s.date for s in samples})
+    if len(dates) <= lookback_days:
+        return samples
+    keep = set(dates[-lookback_days:])
+    return [s for s in samples if s.date in keep]
+
+
 def standardize(
     train: List[Sample], test: List[Sample]
 ) -> Tuple[List[List[float]], List[int], List[List[float]], List[int], List[float], List[float]]:
@@ -2320,6 +2334,7 @@ def main():
     parser.add_argument("--wf-test-days", type=int, default=21, help="Walk-forward test window (trading days)")
     parser.add_argument("--wf-step-days", type=int, default=21, help="Walk-forward step size (trading days)")
     parser.add_argument("--walk-forward-csv", type=str, default="", help="Output CSV for walk-forward daily win-rate report")
+    parser.add_argument("--train-lookback-days", type=int, default=504, help="Recent trading-day window for training/evaluation (<=0 means all)")
     parser.add_argument("--daily-report-md", type=str, default="", help="Output markdown daily recommendation report")
     parser.add_argument("--daily-report-json", type=str, default="", help="Output JSON daily recommendation report")
     parser.add_argument("--db-path", type=str, default="alpha_realtime.db", help="SQLite path for realtime/history cache")
@@ -2380,6 +2395,11 @@ def main():
         type=float,
         default=0.85,
         help="Coverage ratio used by common-date alignment (0~1).",
+    )
+    parser.add_argument(
+        "--prefer-stable-db-snapshot",
+        action="store_true",
+        help="Prefer DB snapshot when online common date is older (default OFF).",
     )
     args = parser.parse_args()
     changed_envs = apply_network_env_patch(force_enable=args.force_network_env)
@@ -2516,7 +2536,7 @@ def main():
         data, aligned_to = align_data_to_common_date(data, min_coverage_ratio=cov)
         # If online refresh produced an older aligned date than existing DB snapshot,
         # keep DB snapshot to avoid large run-to-run drift.
-        if (not args.db_only) and db_aligned_to and aligned_to and aligned_to < db_aligned_to:
+        if args.prefer_stable_db_snapshot and (not args.db_only) and db_aligned_to and aligned_to and aligned_to < db_aligned_to:
             db_view = load_history_from_db(args.db_path, list(data.keys()), dt.date(1990, 1, 1), dt.date.today())
             if db_view:
                 data, aligned_to = align_data_to_common_date(db_view, min_coverage_ratio=cov)
@@ -2557,6 +2577,7 @@ def main():
             global_macro_map=global_macro_map,
             use_liquidity_factor=args.use_liquidity_factor,
         )
+        samples_h = trim_samples_to_recent_window(samples_h, args.train_lookback_days)
         if len(samples_h) < min_samples_required:
             continue
         train, test = train_test_split(samples_h, split_ratio=0.8)
@@ -2748,6 +2769,7 @@ def main():
             global_macro_map=global_macro_map,
             use_liquidity_factor=args.use_liquidity_factor,
         )
+        samples_h = trim_samples_to_recent_window(samples_h, args.train_lookback_days)
         if len(samples_h) >= 120:
             train, test = train_test_split(samples_h, split_ratio=0.8)
             if train and test:
@@ -2949,6 +2971,7 @@ def main():
                 global_macro_map=global_macro_map,
                 use_liquidity_factor=args.use_liquidity_factor,
             )
+            smp = trim_samples_to_recent_window(smp, args.train_lookback_days)
             wf_preds[h] = run_walk_forward_horizon(
                 smp,
                 auto_tune_factor_weights=args.auto_tune_factor_weights,
@@ -2983,6 +3006,8 @@ def main():
         print(f"Universe Mode  : CN ETF Rotation ({len(tickers)} symbols)")
     print(f"Benchmark      : {args.benchmark}")
     print(f"Model Type     : {args.model_type}")
+    print(f"Train Window   : recent {args.train_lookback_days} trading days" if args.train_lookback_days > 0 else "Train Window   : full history")
+    print(f"Stable DB Snap : {'ON' if args.prefer_stable_db_snapshot else 'OFF'}")
     print("Label Mode     : excess return > 0 (fallback: absolute return > 0)")
     print(f"Feature Set    : {', '.join(FEATURE_NAMES)}")
     print("----------------------------------------------")

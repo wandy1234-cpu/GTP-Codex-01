@@ -291,29 +291,95 @@ def md_table(rows: List[List[str]]) -> str:
     return '\n'.join(out)
 
 
+def trim_demo_data(
+    data: Dict[str, List[q.Row]],
+    benchmark: str,
+    max_tickers: int,
+    max_days: int,
+) -> Dict[str, List[q.Row]]:
+    if not data:
+        return {}
+    ordered = list(data.keys())
+    selected: List[str] = []
+    if benchmark in data:
+        selected.append(benchmark)
+    for tk in ordered:
+        if tk == benchmark:
+            continue
+        selected.append(tk)
+        if len(selected) >= max_tickers:
+            break
+
+    out: Dict[str, List[q.Row]] = {}
+    for tk in selected:
+        rows = data.get(tk, [])
+        if max_days > 0 and len(rows) > max_days:
+            out[tk] = rows[-max_days:]
+        else:
+            out[tk] = rows
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--benchmark', default='000300.SS')
     ap.add_argument('--horizon', type=int, default=5)
     ap.add_argument('--topn', type=int, default=10)
     ap.add_argument('--output-md', default='audit_report.md')
+    ap.add_argument('--demo-tickers', type=int, default=18, help='Synthetic universe size used by audit (including benchmark).')
+    ap.add_argument('--demo-days', type=int, default=360, help='Recent synthetic trading days used by audit.')
     args = ap.parse_args()
 
     data = q.generate_demo_data(seed=42)
-    baseline = evaluate(data, args.benchmark, args.horizon, args.topn, disabled_groups=set(), use_constraints=False, use_regime_overlay=False)
+    data = trim_demo_data(
+        data,
+        benchmark=args.benchmark,
+        max_tickers=max(3, args.demo_tickers),
+        max_days=max(120, args.demo_days),
+    )
+
+    eval_cache = {}
+
+    def cached_evaluate(
+        disabled_groups=None,
+        only_groups=None,
+        mode="direct",
+        focus_group=None,
+        use_constraints=False,
+        use_regime_overlay=False,
+    ):
+        dg = tuple(sorted(disabled_groups or set()))
+        og = tuple(sorted(only_groups or set()))
+        key = (dg, og, mode, focus_group, use_constraints, use_regime_overlay)
+        if key not in eval_cache:
+            eval_cache[key] = evaluate(
+                data,
+                args.benchmark,
+                args.horizon,
+                args.topn,
+                disabled_groups=set(dg),
+                only_groups=set(og) if og else None,
+                mode=mode,
+                focus_group=focus_group,
+                use_constraints=use_constraints,
+                use_regime_overlay=use_regime_overlay,
+            )
+        return eval_cache[key]
+
+    baseline = cached_evaluate(disabled_groups=set(), use_constraints=False, use_regime_overlay=False)
 
     ablation = {}
     standalone = {}
     for g in GROUPS:
-        ablation[g] = evaluate(data, args.benchmark, args.horizon, args.topn, disabled_groups={g}, use_constraints=False, use_regime_overlay=False)
-        standalone[g] = evaluate(data, args.benchmark, args.horizon, args.topn, disabled_groups=set(), only_groups={g}, use_constraints=False, use_regime_overlay=False)
+        ablation[g] = cached_evaluate(disabled_groups={g}, use_constraints=False, use_regime_overlay=False)
+        standalone[g] = cached_evaluate(disabled_groups=set(), only_groups={g}, use_constraints=False, use_regime_overlay=False)
 
     placement = {}
     for g in ["broker_revision", "sentiment_macro"]:
         placement[g] = {
-            "direct": evaluate(data, args.benchmark, args.horizon, args.topn, disabled_groups=set(), mode="direct", focus_group=g, use_constraints=False, use_regime_overlay=False),
-            "filter": evaluate(data, args.benchmark, args.horizon, args.topn, disabled_groups={g}, mode="filter", focus_group=g, use_constraints=False, use_regime_overlay=False),
-            "confidence": evaluate(data, args.benchmark, args.horizon, args.topn, disabled_groups={g}, mode="confidence", focus_group=g, use_constraints=False, use_regime_overlay=False),
+            "direct": cached_evaluate(disabled_groups=set(), mode="direct", focus_group=g, use_constraints=False, use_regime_overlay=False),
+            "filter": cached_evaluate(disabled_groups={g}, mode="filter", focus_group=g, use_constraints=False, use_regime_overlay=False),
+            "confidence": cached_evaluate(disabled_groups={g}, mode="confidence", focus_group=g, use_constraints=False, use_regime_overlay=False),
         }
     # macro is included in sentiment_macro group above; keep explicit alias for readability
     placement["global_macro"] = placement["sentiment_macro"]
@@ -424,8 +490,8 @@ def main():
     lines.append('')
 
     lines.append('## 7.5) Portfolio Layer Impact (constrained vs unconstrained)')
-    pc_base = evaluate(data, args.benchmark, args.horizon, args.topn, disabled_groups=set(), use_constraints=False, use_regime_overlay=False)
-    pc_con = evaluate(data, args.benchmark, args.horizon, args.topn, disabled_groups=set(), use_constraints=True, use_regime_overlay=False)
+    pc_base = cached_evaluate(disabled_groups=set(), use_constraints=False, use_regime_overlay=False)
+    pc_con = cached_evaluate(disabled_groups=set(), use_constraints=True, use_regime_overlay=False)
     rows = [["setting", "ann_excess", "IR", "max_dd", "turnover", "concentration_hhi", "utility"]]
     for name, m in [("unconstrained", pc_base), ("constrained", pc_con)]:
         rows.append([
@@ -441,9 +507,9 @@ def main():
     lines.append('')
 
     lines.append('## 7.6) Regime Overlay Impact (old model intact + overlay)')
-    ov_base = evaluate(data, args.benchmark, args.horizon, args.topn, disabled_groups=set(), use_constraints=False, use_regime_overlay=False)
-    ov_reg = evaluate(data, args.benchmark, args.horizon, args.topn, disabled_groups=set(), use_constraints=False, use_regime_overlay=True)
-    ov_full = evaluate(data, args.benchmark, args.horizon, args.topn, disabled_groups=set(), use_constraints=True, use_regime_overlay=True)
+    ov_base = cached_evaluate(disabled_groups=set(), use_constraints=False, use_regime_overlay=False)
+    ov_reg = cached_evaluate(disabled_groups=set(), use_constraints=False, use_regime_overlay=True)
+    ov_full = cached_evaluate(disabled_groups=set(), use_constraints=True, use_regime_overlay=True)
     rows = [["setting", "ann_excess", "IR", "max_dd", "turnover", "win_rate", "utility", "phase_alpha"]]
     for name, m in [("original", ov_base), ("+regime_overlay", ov_reg), ("+regime+constraints", ov_full)]:
         rows.append([

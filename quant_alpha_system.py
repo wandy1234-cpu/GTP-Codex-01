@@ -652,6 +652,52 @@ def fetch_cn_etf_universe_eastmoney(limit: int = 2000) -> List[str]:
     return list(dict.fromkeys(out))
 
 
+def _fetch_eastmoney_stock_list(fs: str, limit: int = 5000) -> List[str]:
+    params = {
+        "pn": "1",
+        "pz": str(max(50, min(limit, 5000))),
+        "po": "1",
+        "np": "1",
+        "fltt": "2",
+        "invt": "2",
+        "fid": "f3",
+        "fs": fs,
+        "fields": "f12,f14",
+    }
+    url = f"https://push2.eastmoney.com/api/qt/clist/get?{urlencode(params)}"
+    payload = fetch_json(url)
+    diff = ((payload.get("data") or {}).get("diff")) or []
+    out: List[str] = []
+    for item in diff:
+        code = str(item.get("f12") or "").strip()
+        if code:
+            out.append(code)
+    return out
+
+
+def fetch_ah_universe_eastmoney(a_limit: int = 6000, h_limit: int = 3500) -> List[str]:
+    """
+    获取 A/H 股票池（尽量覆盖全市场）。
+    - A 股：沪深主板/创业板/科创板（东财 clist）
+    - H 股：港股主板/创业板（东财 clist）
+    """
+    # A-share board buckets in EastMoney listing
+    a_codes = _fetch_eastmoney_stock_list("m:0 t:6,m:0 t:80,m:1 t:2,m:1 t:23", limit=a_limit)
+    h_codes = _fetch_eastmoney_stock_list("m:128 t:3,m:128 t:4", limit=h_limit)
+    out: List[str] = []
+    for code in a_codes:
+        if len(code) == 6 and code.isdigit():
+            if code.startswith(("6", "9")):
+                out.append(f"{code}.SS")
+            else:
+                out.append(f"{code}.SZ")
+    for code in h_codes:
+        c = code.zfill(4)
+        if c.isdigit():
+            out.append(f"{c}.HK")
+    return list(dict.fromkeys(out))
+
+
 def fetch_live_data(
     tickers: List[str], start: dt.date, end: dt.date, providers: List[str], fast_mode: bool = True
 ) -> Dict[str, List[Row]]:
@@ -1282,6 +1328,112 @@ def predict_prob(w: List[float], b: float, x: List[List[float]]) -> List[float]:
     return [sigmoid(sum(w[j] * row[j] for j in range(len(w))) + b) for row in x]
 
 
+def train_mlp_binary(
+    x: List[List[float]],
+    y: List[int],
+    hidden_dim: int = 24,
+    epochs: int = 28,
+    lr: float = 0.003,
+    l2: float = 1e-4,
+    seed: int = 123,
+) -> Dict[str, List]:
+    n = len(x)
+    d = len(x[0])
+    h = max(8, hidden_dim)
+    rng = random.Random(seed)
+
+    w1 = [[rng.uniform(-0.03, 0.03) for _ in range(d)] for _ in range(h)]
+    b1 = [0.0 for _ in range(h)]
+    w2 = [rng.uniform(-0.03, 0.03) for _ in range(h)]
+    b2 = 0.0
+    idx = list(range(n))
+
+    for _ in range(epochs):
+        rng.shuffle(idx)
+        for i in idx:
+            xi = x[i]
+            yi = y[i]
+            z1 = [sum(w1[j][k] * xi[k] for k in range(d)) + b1[j] for j in range(h)]
+            a1 = [math.tanh(z) for z in z1]
+            z2 = sum(w2[j] * a1[j] for j in range(h)) + b2
+            p = sigmoid(z2)
+            dz2 = p - yi
+
+            # output layer update
+            for j in range(h):
+                grad_w2 = dz2 * a1[j] + l2 * w2[j]
+                grad_w2 = max(-5.0, min(5.0, grad_w2))
+                w2[j] -= lr * grad_w2
+            b2 -= lr * dz2
+
+            # hidden layer update
+            for j in range(h):
+                dz1 = dz2 * w2[j] * (1.0 - a1[j] * a1[j])
+                for k in range(d):
+                    grad_w1 = dz1 * xi[k] + l2 * w1[j][k]
+                    grad_w1 = max(-5.0, min(5.0, grad_w1))
+                    w1[j][k] -= lr * grad_w1
+                b1[j] -= lr * dz1
+    return {"w1": w1, "b1": b1, "w2": w2, "b2": b2}
+
+
+def predict_prob_mlp(model: Dict[str, List], x: List[List[float]]) -> List[float]:
+    w1 = model["w1"]
+    b1 = model["b1"]
+    w2 = model["w2"]
+    b2 = model["b2"]
+    out: List[float] = []
+    h = len(w1)
+    d = len(w1[0]) if h else 0
+    for row in x:
+        a1 = []
+        for j in range(h):
+            z = sum(w1[j][k] * row[k] for k in range(d)) + b1[j]
+            a1.append(math.tanh(z))
+        z2 = sum(w2[j] * a1[j] for j in range(h)) + b2
+        out.append(sigmoid(z2))
+    return out
+
+
+def train_model_and_predict(
+    model_type: str, x_train: List[List[float]], y_train: List[int], x_test: List[List[float]]
+) -> Tuple[Dict[str, object], List[float]]:
+    mt = (model_type or "logistic").lower()
+    if mt == "mlp":
+        model = train_mlp_binary(x_train, y_train)
+        probs = predict_prob_mlp(model, x_test)
+        return {"type": "mlp", "model": model}, probs
+    w, b = train_logistic_sgd(x_train, y_train)
+    probs = predict_prob(w, b, x_test)
+    return {"type": "logistic", "w": w, "b": b}, probs
+
+
+def model_predict_one(model_obj: Dict[str, object], x: List[float]) -> float:
+    if model_obj.get("type") == "mlp":
+        return predict_prob_mlp(model_obj["model"], [x])[0]  # type: ignore[index]
+    w = model_obj["w"]  # type: ignore[index]
+    b = model_obj["b"]  # type: ignore[index]
+    return sigmoid(sum(w[j] * x[j] for j in range(len(w))) + b)
+
+
+def model_feature_contrib(model_obj: Dict[str, object], x: List[float]) -> List[float]:
+    if model_obj.get("type") == "mlp":
+        m = model_obj["model"]  # type: ignore[index]
+        w1 = m["w1"]
+        b1 = m["b1"]
+        w2 = m["w2"]
+        contrib = [0.0 for _ in range(len(x))]
+        for j in range(len(w1)):
+            z = sum(w1[j][k] * x[k] for k in range(len(x))) + b1[j]
+            a = math.tanh(z)
+            gate = (1.0 - a * a)
+            for k in range(len(x)):
+                contrib[k] += w2[j] * w1[j][k] * x[k]
+        return contrib
+    w = model_obj["w"]  # type: ignore[index]
+    return [w[j] * x[j] for j in range(len(w))]
+
+
 def best_threshold(y_true: List[int], y_prob: List[float]) -> float:
     best_t, best_f1 = 0.5, -1.0
     for k in range(20, 81):
@@ -1715,6 +1867,7 @@ def write_one_year_report(
 def run_walk_forward_horizon(
     samples: List[Sample],
     auto_tune_factor_weights: bool,
+    model_type: str,
     train_days: int = 756,
     test_days: int = 21,
     step_days: int = 21,
@@ -1750,8 +1903,7 @@ def run_walk_forward_horizon(
         base_scalers = [1.0] * len(FEATURE_NAMES)
         x_train_base = apply_feature_scalers(x_train, base_scalers)
         x_test_base = apply_feature_scalers(x_test, base_scalers)
-        w_base, b_base = train_logistic_sgd(x_train_base, y_train)
-        probs_base = predict_prob(w_base, b_base, x_test_base)
+        _model_base, probs_base = train_model_and_predict(model_type, x_train_base, y_train, x_test_base)
         wr_base = holdout_top20_winrate(test, probs_base, y_test)
         m_base = compute_metrics(y_test, probs_base, threshold=best_threshold(y_test, probs_base))
 
@@ -1760,8 +1912,7 @@ def run_walk_forward_horizon(
             cand_scalers = auto_tune_feature_scalers(x_train, y_train)
             x_train_t = apply_feature_scalers(x_train, cand_scalers)
             x_test_t = apply_feature_scalers(x_test, cand_scalers)
-            w_t, b_t = train_logistic_sgd(x_train_t, y_train)
-            probs_t = predict_prob(w_t, b_t, x_test_t)
+            _model_t, probs_t = train_model_and_predict(model_type, x_train_t, y_train, x_test_t)
             wr_t = holdout_top20_winrate(test, probs_t, y_test)
             m_t = compute_metrics(y_test, probs_t, threshold=best_threshold(y_test, probs_t))
             if (wr_t > wr_base) or (wr_t == wr_base and m_t.auc >= m_base.auc):
@@ -1936,9 +2087,18 @@ def main():
     parser.add_argument(
         "--tickers",
         type=str,
-        default=",".join(DEFAULT_TICKERS),
-        help="Tickers for live download mode",
+        default="",
+        help="Manual tickers (comma-separated). Empty means auto universe by --universe-mode.",
     )
+    parser.add_argument(
+        "--universe-mode",
+        type=str,
+        default="ah_all",
+        choices=["ah_all", "custom", "demo_default"],
+        help="Stock universe source for live mode.",
+    )
+    parser.add_argument("--ah-a-limit", type=int, default=5500, help="A-share universe fetch cap from EastMoney.")
+    parser.add_argument("--ah-h-limit", type=int, default=3200, help="H-share universe fetch cap from EastMoney.")
     parser.add_argument("--cn-etf-rotation", action="store_true", help="Use mainland ETF universe for rotation recommendation")
     parser.add_argument("--cn-etf-limit", type=int, default=800, help="Max ETF symbols to load from Eastmoney universe API")
     parser.add_argument(
@@ -1953,6 +2113,13 @@ def main():
     parser.add_argument("--horizon", type=int, default=5, help="Single horizon fallback (legacy)")
     parser.add_argument("--horizons", type=str, default="5,10,20", help="Multi-horizon labels, e.g. 5,10,20")
     parser.add_argument("--horizon-weights", type=str, default="0.2,0.3,0.5", help="Weights for horizons")
+    parser.add_argument(
+        "--model-type",
+        type=str,
+        default="mlp",
+        choices=["mlp", "logistic"],
+        help="Model family for alpha classification. Default: mlp (deep neural net).",
+    )
     parser.add_argument(
         "--auto-tune-horizon-weights",
         action="store_true",
@@ -2122,7 +2289,23 @@ def main():
                 )
                 tickers = tickers[: args.etf_live_limit]
         else:
-            tickers = ensure_ticker_pool_size(parse_tickers(args.tickers), args.topn, args.benchmark)
+            manual_tickers = parse_tickers(args.tickers)
+            if manual_tickers:
+                tickers = ensure_ticker_pool_size(manual_tickers, args.topn, args.benchmark)
+            elif args.universe_mode == "demo_default":
+                tickers = ensure_ticker_pool_size(DEFAULT_TICKERS[:], args.topn, args.benchmark)
+            elif args.universe_mode == "ah_all":
+                try:
+                    ah_pool = fetch_ah_universe_eastmoney(a_limit=args.ah_a_limit, h_limit=args.ah_h_limit)
+                    if not ah_pool:
+                        raise RuntimeError("empty A/H universe from eastmoney")
+                    tickers = ensure_ticker_pool_size(ah_pool, args.topn, args.benchmark)
+                    print(f"[INFO] Loaded A/H universe size={len(tickers)} (A cap={args.ah_a_limit}, H cap={args.ah_h_limit})")
+                except RuntimeError as exc:
+                    print(f"[WARN] A/H universe fetch failed, fallback built-in list: {exc}")
+                    tickers = ensure_ticker_pool_size(DEFAULT_TICKERS[:], args.topn, args.benchmark)
+            else:
+                tickers = ensure_ticker_pool_size(DEFAULT_TICKERS[:], args.topn, args.benchmark)
         providers = parse_providers(args.providers)
         if args.db_only:
             data = load_history_from_db(args.db_path, tickers, start, end)
@@ -2228,14 +2411,13 @@ def main():
         base_scalers = [1.0] * len(FEATURE_NAMES)
         x_train_base = apply_feature_scalers(x_train, base_scalers)
         x_test_base = apply_feature_scalers(x_test, base_scalers)
-        w_base, b_base = train_logistic_sgd(x_train_base, y_train)
-        probs_base = predict_prob(w_base, b_base, x_test_base)
+        model_base, probs_base = train_model_and_predict(args.model_type, x_train_base, y_train, x_test_base)
         t_base = best_threshold(y_test, probs_base)
         m_base = compute_metrics(y_test, probs_base, threshold=t_base)
         wr_base = holdout_top20_winrate(test, probs_base, y_test)
 
         scalers = base_scalers
-        w, b = w_base, b_base
+        model_obj = model_base
         probs = probs_base
         t = t_base
         m = m_base
@@ -2244,14 +2426,13 @@ def main():
             cand_scalers = auto_tune_feature_scalers(x_train, y_train)
             x_train_t = apply_feature_scalers(x_train, cand_scalers)
             x_test_t = apply_feature_scalers(x_test, cand_scalers)
-            w_t, b_t = train_logistic_sgd(x_train_t, y_train)
-            probs_t = predict_prob(w_t, b_t, x_test_t)
+            model_t, probs_t = train_model_and_predict(args.model_type, x_train_t, y_train, x_test_t)
             t_t = best_threshold(y_test, probs_t)
             m_t = compute_metrics(y_test, probs_t, threshold=t_t)
             wr_t = holdout_top20_winrate(test, probs_t, y_test)
             if (wr_t > wr_base) or (wr_t == wr_base and m_t.auc >= m_base.auc):
                 scalers = cand_scalers
-                w, b = w_t, b_t
+                model_obj = model_t
                 probs = probs_t
                 t = t_t
                 m = m_t
@@ -2266,8 +2447,8 @@ def main():
         cmap: Dict[str, List[float]] = {}
         for s in latest:
             x = [((s.features[i] - means[i]) / stds[i]) * scalers[i] for i in range(len(means))]
-            p = sigmoid(sum(w[j] * x[j] for j in range(len(w))) + b)
-            contrib = [w[j] * x[j] for j in range(len(w))]
+            p = model_predict_one(model_obj, x)
+            contrib = model_feature_contrib(model_obj, x)
             risk20 = s.features[4] if len(s.features) > 4 else 0.0
             if latest_quote and s.ticker in latest_quote:
                 px, ts = latest_quote[s.ticker]
@@ -2302,14 +2483,13 @@ def main():
                 base_scalers = [1.0] * len(FEATURE_NAMES)
                 x_train_base = apply_feature_scalers(x_train, base_scalers)
                 x_test_base = apply_feature_scalers(x_test, base_scalers)
-                w_base, b_base = train_logistic_sgd(x_train_base, y_train)
-                probs_base = predict_prob(w_base, b_base, x_test_base)
+                model_base, probs_base = train_model_and_predict(args.model_type, x_train_base, y_train, x_test_base)
                 t_base = best_threshold(y_test, probs_base)
                 m_base = compute_metrics(y_test, probs_base, threshold=t_base)
                 wr_base = holdout_top20_winrate(test, probs_base, y_test)
 
                 scalers = base_scalers
-                w, b = w_base, b_base
+                model_obj = model_base
                 probs = probs_base
                 t = t_base
                 m = m_base
@@ -2317,14 +2497,13 @@ def main():
                     cand_scalers = auto_tune_feature_scalers(x_train, y_train)
                     x_train_t = apply_feature_scalers(x_train, cand_scalers)
                     x_test_t = apply_feature_scalers(x_test, cand_scalers)
-                    w_t, b_t = train_logistic_sgd(x_train_t, y_train)
-                    probs_t = predict_prob(w_t, b_t, x_test_t)
+                    model_t, probs_t = train_model_and_predict(args.model_type, x_train_t, y_train, x_test_t)
                     t_t = best_threshold(y_test, probs_t)
                     m_t = compute_metrics(y_test, probs_t, threshold=t_t)
                     wr_t = holdout_top20_winrate(test, probs_t, y_test)
                     if (wr_t > wr_base) or (wr_t == wr_base and m_t.auc >= m_base.auc):
                         scalers = cand_scalers
-                        w, b = w_t, b_t
+                        model_obj = model_t
                         probs = probs_t
                         t = t_t
                         m = m_t
@@ -2338,8 +2517,8 @@ def main():
                 cmap: Dict[str, List[float]] = {}
                 for s in latest:
                     x = [((s.features[i] - means[i]) / stds[i]) * scalers[i] for i in range(len(means))]
-                    p = sigmoid(sum(w[j] * x[j] for j in range(len(w))) + b)
-                    contrib = [w[j] * x[j] for j in range(len(w))]
+                    p = model_predict_one(model_obj, x)
+                    contrib = model_feature_contrib(model_obj, x)
                     risk20 = s.features[4] if len(s.features) > 4 else 0.0
                     if latest_quote and s.ticker in latest_quote:
                         px, ts = latest_quote[s.ticker]
@@ -2449,6 +2628,7 @@ def main():
             wf_preds[h] = run_walk_forward_horizon(
                 smp,
                 auto_tune_factor_weights=args.auto_tune_factor_weights,
+                model_type=args.model_type,
                 train_days=max(40, args.wf_train_days),
                 test_days=max(5, args.wf_test_days),
                 step_days=max(1, args.wf_step_days),
@@ -2478,6 +2658,7 @@ def main():
     if args.cn_etf_rotation:
         print(f"Universe Mode  : CN ETF Rotation ({len(tickers)} symbols)")
     print(f"Benchmark      : {args.benchmark}")
+    print(f"Model Type     : {args.model_type}")
     print("Label Mode     : excess return > 0 (fallback: absolute return > 0)")
     print(f"Feature Set    : {', '.join(FEATURE_NAMES)}")
     print("----------------------------------------------")

@@ -42,11 +42,15 @@ python quant_alpha_system.py
 - `--no-db-only`（允许联网拉取/刷新数据，**默认开启**）
 - `--force-network-env`（默认开启：自动清理常见离线环境变量）
 - `--no-force-network-env`（禁用上述自动清理）
+- `--tickers "600519.SS,000858.SZ,0700.HK"`（手动股票池，逗号分隔）
+- `--universe-mode ah_all|custom|demo_default`（live 模式股票池来源，默认 `ah_all`）
+- `--ah-a-limit 5500` / `--ah-h-limit 3200`（A/H 全市场抓取上限）
 - `--cn-etf-rotation`（启用大陆 ETF 轮动模式：自动拉取沪深 ETF 池）
 - `--cn-etf-limit 800`（大陆 ETF 池拉取上限）
 - `--etf-live-limit 120`（ETF 在线模式自动截断股票池，避免超时）
 - `--horizons 5,10,20`（多标签周期）
 - `--horizon-weights 0.2,0.3,0.5`（多标签融合权重）
+- `--model-type mlp|logistic`（模型类型，默认 `mlp` 深度学习）
 - `--auto-tune-horizon-weights`（根据 holdout 回测胜率自动反推多周期融合权重）
 - `--min-samples 500`（每个 horizon 最低样本门槛；ETF 模式默认自动放宽到 180）
 - `--report-csv one_year_report.csv`（导出近1年每日胜率报告）
@@ -268,7 +272,7 @@ python audit_quant_system.py --output-md audit_report.md
 - regime overlay 前后对比（original vs +overlay）
 - 模型按“超额收益质量”（非命中率）排序对比
 - most likely issues / highest ROI improvements
-- 保留时间切分 + Logistic SGD + F1 阈值搜索 + TopN 概率排序
+- 保留时间切分 +（默认）MLP 深度学习 / Logistic 备选 + F1 阈值搜索 + TopN 概率排序
 
 ## 7) 偏 Alpha 下一步建议
 
